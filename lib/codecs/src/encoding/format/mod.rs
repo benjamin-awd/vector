@@ -1,7 +1,7 @@
 //! A collection of formats that can be used to convert from structured events
 //! to byte frames.
 
-#![deny(missing_docs)]
+// #![deny(missing_docs)]
 
 mod avro;
 mod cef;

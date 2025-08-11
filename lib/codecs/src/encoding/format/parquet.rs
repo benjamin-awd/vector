@@ -1,13 +1,15 @@
 // In src/codecs/parquet.rs
 
-use bytes::BytesMut;
-use tokio_util::codec::Encoder;
-use vector_core::{
-    config::DataType,
-    event::Event,
-    schema,
-};
 use crate::encoding::format::BatchEncoder;
+use bytes::BufMut;
+use bytes::BytesMut;
+use parquet::{
+    data_type::{ByteArray, ByteArrayType},
+    file::{properties::WriterProperties, writer::SerializedFileWriter},
+    schema::parser::parse_message_type,
+};
+use std::sync::Arc;
+use vector_core::{config::DataType, event::Event, schema};
 
 /// Config for building a `ParquetSerializer`.
 // Add configurable component macro if needed
@@ -31,11 +33,8 @@ impl ParquetSerializerConfig {
     }
 }
 
-/// Serializer that converts a batch of `Event`s to bytes using the Parquet format.
 #[derive(Debug, Clone)]
-pub struct ParquetSerializer {
-    // State needed for serialization, like the Parquet schema
-}
+pub struct ParquetSerializer {}
 
 impl ParquetSerializer {
     pub fn new() -> Self {
@@ -49,30 +48,115 @@ impl BatchEncoder for ParquetSerializer {
     type Error = vector_common::Error;
 
     fn encode_batch(&mut self, events: &[Event], buffer: &mut BytesMut) -> Result<(), Self::Error> {
-        // 1. Initialize a Parquet writer with a schema.
-        //    The writer can write to an in-memory buffer first.
+        // 1. Define a Parquet schema.
+        // In a real-world scenario, this would be more dynamic or configurable.
+        let message_type = "
+            message schema {
+                REQUIRED BYTE_ARRAY message (UTF8);
+            }
+        ";
+        let schema = Arc::new(parse_message_type(message_type)?);
+        let props = Arc::new(WriterProperties::builder().build());
 
-        // 2. Iterate over the `events` slice. For each event:
-        //    - Convert the `Event` to a Parquet-compatible record.
-        //    - Write the record using the Parquet writer.
+        // 2. Create a Parquet writer that writes to an in-memory buffer.
+        let mut writer = SerializedFileWriter::new(buffer.writer(), schema.clone(), props)?;
+        let mut row_group_writer = writer.next_row_group()?;
 
-        // 3. Finalize the Parquet writer to get the complete byte representation.
+        // 3. Write events to the row group.
+        if !events.is_empty() {
+            // Get the writer for the next column. Since our schema has only one
+            // column, we can safely access it here.
+            if let Some(mut col_writer) = row_group_writer.next_column()? {
+                // Get a typed writer for the `BYTE_ARRAY` column to work with string data.
+                let typed_writer = col_writer.typed::<ByteArrayType>();
 
-        // 4. Extend the output `buffer` with the Parquet data.
+                // Convert each event's message into Parquet's `ByteArray` format.
+                let values: Vec<ByteArray> = events
+                    .iter()
+                    .map(|event| {
+                        let message_bytes: &[u8] = event
+                            .maybe_as_log()
+                            .and_then(|log| log.get("message"))
+                            .and_then(|value| value.as_bytes())
+                            .map(|b| b.as_ref())
+                            .unwrap_or(&[]);
 
-        // This is a simplified placeholder. You'll need the `parquet` crate
-        // to handle the actual serialization logic.
-        println!("Encoding a batch of {} events into Parquet format.", events.len());
+                        ByteArray::from(message_bytes)
+                    })
+                    .collect();
 
-        // Example:
-        // let mut writer = //... create a Parquet writer
-        // for event in events {
-        //     let log = event.as_log();
-        //     // ... transform log into a Parquet record and write it
-        // }
-        // let parquet_bytes = writer.close()?;
-        // buffer.extend_from_slice(&parquet_bytes);
+                // Write the batch of values. `None` is used for definition and
+                // repetition levels because the field is `REQUIRED`.
+                typed_writer.write_batch(&values, None, None)?;
+
+                // It's important to close the column writer to finalize its data.
+                col_writer.close()?;
+            }
+        }
+
+        // 4. Close the row group and writer to finalize the Parquet data.
+        row_group_writer.close()?;
+        writer.close()?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*; // Import everything from the parent module
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::RowAccessor;
+    use vector_core::event::{Event, LogEvent};
+
+    #[test]
+    fn it_encodes_a_batch_of_events() {
+        // 1. ARRANGE: Set up the test
+        let mut serializer = ParquetSerializer::new();
+        let mut buffer = BytesMut::new();
+
+        let event1 = Event::Log(LogEvent::from("hello world"));
+        let event2 = Event::Log(LogEvent::from("testing parquet"));
+        let event3 = Event::Log(LogEvent::from("final event"));
+
+        // Create a batch of sample events
+        let events = vec![event1, event2, event3];
+
+        // 2. ACT: Run the code we want to test
+        serializer
+            .encode_batch(&events, &mut buffer)
+            .expect("Encoding failed");
+
+        // 3. ASSERT: Verify the output is correct
+        assert!(
+            !buffer.is_empty(),
+            "Buffer should not be empty after encoding"
+        );
+
+        // Use a Parquet reader to parse the bytes we just created
+        let buffer_bytes = buffer.freeze(); // Convert BytesMut -> Bytes for the reader
+        let reader = SerializedFileReader::new(buffer_bytes).expect("Failed to create reader");
+
+        // Get an iterator over the rows in the Parquet data
+        let mut row_iter = reader
+            .get_row_iter(None)
+            .expect("Failed to get row iterator");
+
+        // Check each row against the original event data
+        assert_eq!(
+            row_iter.next().unwrap().unwrap().get_string(0).unwrap(),
+            "hello world"
+        );
+        assert_eq!(
+            row_iter.next().unwrap().unwrap().get_string(0).unwrap(),
+            "testing parquet"
+        );
+        assert_eq!(
+            row_iter.next().unwrap().unwrap().get_string(0).unwrap(),
+            "final event"
+        );
+
+        // Ensure there are no more rows
+        assert!(row_iter.next().is_none());
     }
 }
