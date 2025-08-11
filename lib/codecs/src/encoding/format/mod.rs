@@ -12,10 +12,12 @@ mod json;
 mod logfmt;
 mod native;
 mod native_json;
+mod parquet;
 mod protobuf;
 mod raw_message;
 mod text;
 
+use bytes::BytesMut;
 use std::fmt::Debug;
 
 pub use self::csv::{CsvSerializer, CsvSerializerConfig};
@@ -27,6 +29,7 @@ pub use json::{JsonSerializer, JsonSerializerConfig, JsonSerializerOptions};
 pub use logfmt::{LogfmtSerializer, LogfmtSerializerConfig};
 pub use native::{NativeSerializer, NativeSerializerConfig};
 pub use native_json::{NativeJsonSerializer, NativeJsonSerializerConfig};
+pub use parquet::{ParquetSerializer, ParquetSerializerConfig};
 pub use protobuf::{ProtobufSerializer, ProtobufSerializerConfig, ProtobufSerializerOptions};
 pub use raw_message::{RawMessageSerializer, RawMessageSerializerConfig};
 pub use text::{TextSerializer, TextSerializerConfig};
@@ -50,3 +53,9 @@ impl<Encoder> Serializer for Encoder where
 }
 
 dyn_clone::clone_trait_object!(Serializer);
+
+pub trait BatchEncoder {
+    type Error;
+
+    fn encode_batch(&mut self, events: &[Event], buffer: &mut BytesMut) -> Result<(), Self::Error>;
+}
