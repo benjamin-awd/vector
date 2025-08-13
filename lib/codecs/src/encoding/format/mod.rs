@@ -17,7 +17,6 @@ mod protobuf;
 mod raw_message;
 mod text;
 
-use bytes::BytesMut;
 use std::fmt::Debug;
 
 pub use self::csv::{CsvSerializer, CsvSerializerConfig};
@@ -53,9 +52,3 @@ impl<Encoder> Serializer for Encoder where
 }
 
 dyn_clone::clone_trait_object!(Serializer);
-
-pub trait BatchEncoder {
-    type Error;
-
-    fn encode_batch(&mut self, events: &[Event], buffer: &mut BytesMut) -> Result<(), Self::Error>;
-}

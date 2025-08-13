@@ -7,7 +7,7 @@ use vector_lib::config::telemetry;
 
 #[derive(Clone, Debug)]
 pub(super) struct AmqpEncoder {
-    pub(super) encoder: crate::codecs::Encoder<()>,
+    pub(super) encoder: crate::codecs::Encoder,
     pub(super) transformer: crate::codecs::Transformer,
 }
 

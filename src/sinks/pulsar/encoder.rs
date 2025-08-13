@@ -11,7 +11,7 @@ use vector_lib::{config::telemetry, EstimatedJsonEncodedSizeOf};
 
 #[derive(Clone, Debug)]
 pub(super) struct PulsarEncoder {
-    pub(super) encoder: crate::codecs::Encoder<()>,
+    pub(super) encoder: crate::codecs::Encoder,
     pub(super) transformer: crate::codecs::Transformer,
 }
 

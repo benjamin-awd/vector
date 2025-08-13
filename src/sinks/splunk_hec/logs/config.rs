@@ -222,7 +222,7 @@ impl HecLogsSinkConfig {
 
         let transformer = self.encoding.transformer();
         let serializer = self.encoding.build()?;
-        let encoder = Encoder::<()>::new(serializer);
+        let encoder = Encoder::new(serializer);
         let encoder = HecLogsEncoder {
             transformer,
             encoder,

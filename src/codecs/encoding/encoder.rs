@@ -1,186 +1,56 @@
+use crate::internal_events::{EncoderFramingError, EncoderSerializeError};
 use bytes::BytesMut;
-use tokio_util::codec::Encoder as _;
-use vector_lib::codecs::{
-    encoding::{Error, Framer, Serializer},
-    CharacterDelimitedEncoder, NewlineDelimitedEncoder, TextSerializerConfig,
-};
-
-use crate::{
-    event::Event,
-    internal_events::{EncoderFramingError, EncoderSerializeError},
-};
+use tokio_util::codec::Encoder as TokioEncoder;
+use vector_lib::codecs::encoding::{Codec, Error}; // Make sure your `use` path is correct
+use vector_lib::event::Event;
 
 #[derive(Debug, Clone)]
-/// An encoder that can encode structured events into byte frames.
-pub struct Encoder<Framer>
-where
-    Framer: Clone,
-{
-    framer: Framer,
-    serializer: Serializer,
+/// An encoder that provides a streaming `tokio_util::codec::Encoder` interface
+/// for stream-based codecs.
+pub struct Encoder {
+    codec: Codec,
 }
 
-impl Default for Encoder<Framer> {
-    fn default() -> Self {
-        Self {
-            framer: NewlineDelimitedEncoder::default().into(),
-            serializer: TextSerializerConfig::default().build().into(),
-        }
+impl Encoder {
+    /// Creates a new `Encoder` from a `Codec`.
+    pub fn new(codec: Codec) -> Self {
+        Self { codec }
     }
 }
 
-impl Default for Encoder<()> {
-    fn default() -> Self {
-        Self {
-            framer: (),
-            serializer: TextSerializerConfig::default().build().into(),
-        }
-    }
-}
+/// This implementation allows the `Encoder` to be used with streaming utilities
+/// like `FramedWrite`.
+impl TokioEncoder<Event> for Encoder {
+    type Error = Error;
 
-impl<Framer> Encoder<Framer>
-where
-    Framer: Clone,
-{
-    /// Serialize the event without applying framing.
-    pub fn serialize(&mut self, event: Event, buffer: &mut BytesMut) -> Result<(), Error> {
-        let len = buffer.len();
-        let mut payload = buffer.split_off(len);
+    fn encode(&mut self, event: Event, buffer: &mut BytesMut) -> Result<(), Self::Error> {
+        // We match on the codec to ensure we only try to encode with a streaming codec.
+        match &mut self.codec {
+            Codec::Stream(serializer, framer) => {
+                // This logic is the same as before, but it's now safely
+                // scoped to only run for streaming codecs.
+                let len = buffer.len();
+                let mut payload = buffer.split_off(len);
 
-        self.serialize_at_start(event, &mut payload)?;
+                serializer.encode(event, &mut payload).map_err(|error| {
+                    emit!(EncoderSerializeError { error: &error });
+                    Error::SerializingError(error)
+                })?;
 
-        buffer.unsplit(payload);
+                framer.encode((), &mut payload).map_err(|error| {
+                    emit!(EncoderFramingError { error: &error });
+                    Error::FramingError(error)
+                })?;
 
-        Ok(())
-    }
-
-    /// Serialize the event without applying framing, at the start of the provided buffer.
-    fn serialize_at_start(&mut self, event: Event, buffer: &mut BytesMut) -> Result<(), Error> {
-        self.serializer.encode(event, buffer).map_err(|error| {
-            emit!(EncoderSerializeError { error: &error });
-            Error::SerializingError(error)
-        })
-    }
-}
-
-impl Encoder<Framer> {
-    /// Creates a new `Encoder` with the specified `Serializer` to produce bytes
-    /// from a structured event, and the `Framer` to wrap these into a byte
-    /// frame.
-    pub const fn new(framer: Framer, serializer: Serializer) -> Self {
-        Self { framer, serializer }
-    }
-
-    /// Get the framer.
-    pub const fn framer(&self) -> &Framer {
-        &self.framer
-    }
-
-    /// Get the serializer.
-    pub const fn serializer(&self) -> &Serializer {
-        &self.serializer
-    }
-
-    /// Get the prefix that encloses a batch of events.
-    pub const fn batch_prefix(&self) -> &[u8] {
-        match (&self.framer, &self.serializer) {
-            (
-                Framer::CharacterDelimited(CharacterDelimitedEncoder { delimiter: b',' }),
-                Serializer::Json(_) | Serializer::NativeJson(_),
-            ) => b"[",
-            _ => &[],
-        }
-    }
-
-    /// Get the suffix that encloses a batch of events.
-    pub const fn batch_suffix(&self, empty: bool) -> &[u8] {
-        match (&self.framer, &self.serializer, empty) {
-            (
-                Framer::CharacterDelimited(CharacterDelimitedEncoder { delimiter: b',' }),
-                Serializer::Json(_) | Serializer::NativeJson(_),
-                _,
-            ) => b"]",
-            (Framer::NewlineDelimited(_), _, false) => b"\n",
-            _ => &[],
-        }
-    }
-
-    /// Get the HTTP content type.
-    pub const fn content_type(&self) -> &'static str {
-        match (&self.serializer, &self.framer) {
-            (Serializer::Json(_) | Serializer::NativeJson(_), Framer::NewlineDelimited(_)) => {
-                "application/x-ndjson"
+                buffer.unsplit(payload);
+                Ok(())
             }
-            (
-                Serializer::Gelf(_) | Serializer::Json(_) | Serializer::NativeJson(_),
-                Framer::CharacterDelimited(CharacterDelimitedEncoder { delimiter: b',' }),
-            ) => "application/json",
-            (Serializer::Native(_), _) | (Serializer::Protobuf(_), _) => "application/octet-stream",
-            (
-                Serializer::Avro(_)
-                | Serializer::Cef(_)
-                | Serializer::Csv(_)
-                | Serializer::Gelf(_)
-                | Serializer::Json(_)
-                | Serializer::Logfmt(_)
-                | Serializer::NativeJson(_)
-                | Serializer::RawMessage(_)
-                | Serializer::Text(_),
-                _,
-            ) => "text/plain",
+            Codec::Batch(_) => {
+                // This encoder is for streaming sinks, so if it's given a batch codec,
+                // it's a programming error. We panic to fail fast.
+                panic!("Attempted to use a batch-only codec in a streaming sink context.");
+            }
         }
-    }
-}
-
-impl Encoder<()> {
-    /// Creates a new `Encoder` with the specified `Serializer` to produce bytes
-    /// from a structured event.
-    pub const fn new(serializer: Serializer) -> Self {
-        Self {
-            framer: (),
-            serializer,
-        }
-    }
-
-    /// Get the serializer.
-    pub const fn serializer(&self) -> &Serializer {
-        &self.serializer
-    }
-}
-
-impl tokio_util::codec::Encoder<Event> for Encoder<Framer> {
-    type Error = Error;
-
-    fn encode(&mut self, event: Event, buffer: &mut BytesMut) -> Result<(), Self::Error> {
-        let len = buffer.len();
-        let mut payload = buffer.split_off(len);
-
-        self.serialize_at_start(event, &mut payload)?;
-
-        // Frame the serialized event.
-        self.framer.encode((), &mut payload).map_err(|error| {
-            emit!(EncoderFramingError { error: &error });
-            Error::FramingError(error)
-        })?;
-
-        buffer.unsplit(payload);
-
-        Ok(())
-    }
-}
-
-impl tokio_util::codec::Encoder<Event> for Encoder<()> {
-    type Error = Error;
-
-    fn encode(&mut self, event: Event, buffer: &mut BytesMut) -> Result<(), Self::Error> {
-        let len = buffer.len();
-        let mut payload = buffer.split_off(len);
-
-        self.serialize_at_start(event, &mut payload)?;
-
-        buffer.unsplit(payload);
-
-        Ok(())
     }
 }
 
@@ -189,11 +59,15 @@ mod tests {
     use bytes::BufMut;
     use futures_util::{SinkExt, StreamExt};
     use tokio_util::codec::FramedWrite;
-    use vector_lib::codecs::encoding::BoxedFramingError;
+    use vector_lib::codecs::encoding::{
+        BoxedFramingError, Codec, Framer, SerializerConfig, StreamingSerializer,
+        TextSerializerConfig,
+    };
     use vector_lib::event::LogEvent;
 
     use super::*;
 
+    // No changes are needed for your test helper structs.
     #[derive(Debug, Clone)]
     struct ParenEncoder;
 
@@ -203,7 +77,7 @@ mod tests {
         }
     }
 
-    impl tokio_util::codec::Encoder<()> for ParenEncoder {
+    impl tokio_util::codec::Encoder for ParenEncoder {
         type Error = BoxedFramingError;
 
         fn encode(&mut self, _: (), dst: &mut BytesMut) -> Result<(), Self::Error> {
@@ -230,7 +104,7 @@ mod tests {
         }
     }
 
-    impl<T> tokio_util::codec::Encoder<()> for ErrorNthEncoder<T>
+    impl<T> tokio_util::codec::Encoder for ErrorNthEncoder<T>
     where
         T: tokio_util::codec::Encoder<(), Error = BoxedFramingError>,
     {
@@ -250,10 +124,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_encode_events_sink_empty() {
-        let encoder = Encoder::<Framer>::new(
-            Framer::Boxed(Box::new(ParenEncoder::new())),
-            TextSerializerConfig::default().build().into(),
-        );
+        let serializer = StreamingSerializer::Text(TextSerializerConfig::default().build());
+        let framer = Framer::Boxed(Box::new(ParenEncoder::new()));
+        let codec = Codec::Stream(serializer.into(), framer);
+        let encoder = Encoder::new(codec);
+
         let source = futures::stream::iter(vec![
             Event::Log(LogEvent::from("foo")),
             Event::Log(LogEvent::from("bar")),
@@ -269,10 +144,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_encode_events_sink_non_empty() {
-        let encoder = Encoder::<Framer>::new(
-            Framer::Boxed(Box::new(ParenEncoder::new())),
-            TextSerializerConfig::default().build().into(),
-        );
+        let serializer = StreamingSerializer::Text(TextSerializerConfig::default().build());
+        let framer = Framer::Boxed(Box::new(ParenEncoder::new()));
+        let codec = Codec::Stream(serializer.into(), framer);
+        let encoder = Encoder::new(codec);
+
         let source = futures::stream::iter(vec![
             Event::Log(LogEvent::from("bar")),
             Event::Log(LogEvent::from("baz")),
@@ -288,10 +164,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_encode_events_sink_empty_handle_framing_error() {
-        let encoder = Encoder::<Framer>::new(
-            Framer::Boxed(Box::new(ErrorNthEncoder::new(ParenEncoder::new(), 1))),
-            TextSerializerConfig::default().build().into(),
-        );
+        let serializer = StreamingSerializer::Text(TextSerializerConfig::default().build());
+        let framer = Framer::Boxed(Box::new(ErrorNthEncoder::new(ParenEncoder::new(), 1)));
+        let codec = Codec::Stream(serializer.into(), framer);
+        let encoder = Encoder::new(codec);
+
         let source = futures::stream::iter(vec![
             Event::Log(LogEvent::from("foo")),
             Event::Log(LogEvent::from("bar")),
@@ -308,10 +185,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_encode_events_sink_non_empty_handle_framing_error() {
-        let encoder = Encoder::<Framer>::new(
-            Framer::Boxed(Box::new(ErrorNthEncoder::new(ParenEncoder::new(), 1))),
-            TextSerializerConfig::default().build().into(),
-        );
+        let serializer = StreamingSerializer::Text(TextSerializerConfig::default().build());
+        let framer = Framer::Boxed(Box::new(ErrorNthEncoder::new(ParenEncoder::new(), 1)));
+        let codec = Codec::Stream(serializer.into(), framer);
+        let encoder = Encoder::new(codec);
+
         let source = futures::stream::iter(vec![
             Event::Log(LogEvent::from("bar")),
             Event::Log(LogEvent::from("baz")),
@@ -328,10 +206,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_encode_batch_newline() {
-        let encoder = Encoder::<Framer>::new(
-            Framer::NewlineDelimited(NewlineDelimitedEncoder::default()),
-            TextSerializerConfig::default().build().into(),
-        );
+        // Here we build the codec directly from the config, which is a more
+        // common use case for standard (non-test) framers.
+        let config = SerializerConfig::Text(TextSerializerConfig::default());
+        let codec = config.build().unwrap();
+        let encoder = Encoder::new(codec);
+
         let source = futures::stream::iter(vec![
             Event::Log(LogEvent::from("bar")),
             Event::Log(LogEvent::from("baz")),

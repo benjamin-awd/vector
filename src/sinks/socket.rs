@@ -146,7 +146,7 @@ impl SinkConfig for SocketSinkConfig {
             Mode::Udp(UdpMode { config, encoding }) => {
                 let transformer = encoding.transformer();
                 let serializer = encoding.build()?;
-                let encoder = Encoder::<()>::new(serializer);
+                let encoder = Encoder::new(serializer);
                 config.build(transformer, encoder)
             }
             #[cfg(unix)]

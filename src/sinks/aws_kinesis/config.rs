@@ -116,7 +116,7 @@ where
 
     let transformer = config.encoding.transformer();
     let serializer = config.encoding.build()?;
-    let encoder = Encoder::<()>::new(serializer);
+    let encoder = Encoder::new(serializer);
 
     let request_builder = KinesisRequestBuilder::<RR> {
         compression: config.compression,

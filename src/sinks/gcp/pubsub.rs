@@ -156,7 +156,7 @@ struct PubsubSink {
     auth: GcpAuthenticator,
     uri_base: String,
     transformer: Transformer,
-    encoder: Encoder<()>,
+    encoder: Encoder,
 }
 
 impl PubsubSink {
@@ -171,7 +171,7 @@ impl PubsubSink {
 
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build()?;
-        let encoder = Encoder::<()>::new(serializer);
+        let encoder = Encoder::new(serializer);
 
         Ok(Self {
             auth,
@@ -191,7 +191,7 @@ impl PubsubSink {
 
 struct PubSubSinkEventEncoder {
     transformer: Transformer,
-    encoder: Encoder<()>,
+    encoder: Encoder,
 }
 
 impl HttpEventEncoder<Value> for PubSubSinkEventEncoder {

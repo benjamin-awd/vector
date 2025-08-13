@@ -11,7 +11,7 @@ pub(super) fn encode_event(
     key: String,
     score: Option<u64>,
     transformer: &Transformer,
-    encoder: &mut Encoder<()>,
+    encoder: &mut Encoder,
     byte_size: &mut GroupedCountByteSize,
 ) -> Option<RedisKvEntry> {
     transformer.transform(&mut event);
@@ -31,7 +31,7 @@ pub(super) fn encode_event(
 fn encode_events(
     events: Vec<RedisEvent>,
     transformer: &Transformer,
-    encoder: &mut Encoder<()>,
+    encoder: &mut Encoder,
 ) -> EncodeResult<Vec<RedisKvEntry>> {
     let mut byte_size = telemetry().create_request_count_byte_size();
     let request = events
@@ -65,7 +65,7 @@ fn encode_events(
 pub(super) fn request_builder(
     mut events: Vec<RedisEvent>,
     transformer: &Transformer,
-    encoder: &mut Encoder<()>,
+    encoder: &mut Encoder,
 ) -> RedisRequest {
     let finalizers = events.take_finalizers();
     let builder = RequestMetadataBuilder::from_events(&events);

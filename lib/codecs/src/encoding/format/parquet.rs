@@ -1,6 +1,6 @@
 // In src/codecs/parquet.rs
 
-use crate::encoding::format::BatchEncoder;
+use crate::encoding::BatchEncoder;
 use bytes::BufMut;
 use bytes::BytesMut;
 use parquet::{
@@ -9,10 +9,11 @@ use parquet::{
     schema::parser::parse_message_type,
 };
 use std::sync::Arc;
+use vector_config_macros::configurable_component;
 use vector_core::{config::DataType, event::Event, schema};
 
 /// Config for building a `ParquetSerializer`.
-// Add configurable component macro if needed
+#[configurable_component]
 #[derive(Debug, Clone, Default)]
 pub struct ParquetSerializerConfig {
     // Configuration options for Parquet, such as schema definition
@@ -25,7 +26,7 @@ impl ParquetSerializerConfig {
     }
 
     pub fn input_type(&self) -> DataType {
-        DataType::Log // Or whatever data type is appropriate
+        DataType::all_bits()
     }
 
     pub fn schema_requirement(&self) -> schema::Requirement {
@@ -41,6 +42,12 @@ impl ParquetSerializer {
         Self {
             // Initialize Parquet options here
         }
+    }
+}
+
+impl Default for ParquetSerializer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

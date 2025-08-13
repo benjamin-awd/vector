@@ -11,7 +11,7 @@ use super::{config::NatsHeaderConfig, sink::NatsEvent};
 
 pub(super) struct NatsEncoder {
     pub(super) transformer: Transformer,
-    pub(super) encoder: Encoder<()>,
+    pub(super) encoder: Encoder,
 }
 
 impl encoding::Encoder<Event> for NatsEncoder {

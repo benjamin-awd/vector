@@ -13,13 +13,13 @@ use crate::{
 pub struct KafkaRequestBuilder {
     pub key_field: Option<OwnedTargetPath>,
     pub headers_key: Option<OwnedTargetPath>,
-    pub encoder: (Transformer, Encoder<()>),
+    pub encoder: (Transformer, Encoder),
 }
 
 impl RequestBuilder<(String, Event)> for KafkaRequestBuilder {
     type Metadata = KafkaRequestMetadata;
     type Events = Event;
-    type Encoder = (Transformer, Encoder<()>);
+    type Encoder = (Transformer, Encoder);
     type Payload = Bytes;
     type Request = KafkaRequest;
     type Error = std::io::Error;

@@ -20,7 +20,7 @@ use crate::{
 #[derive(Clone)]
 pub struct KinesisRequestBuilder<R> {
     pub compression: Compression,
-    pub encoder: (Transformer, Encoder<()>),
+    pub encoder: (Transformer, Encoder),
     pub _phantom: PhantomData<R>,
 }
 
@@ -84,7 +84,7 @@ where
 {
     type Metadata = KinesisMetadata;
     type Events = Event;
-    type Encoder = (Transformer, Encoder<()>);
+    type Encoder = (Transformer, Encoder);
     type Payload = Bytes;
     type Request = KinesisRequest<R>;
     type Error = io::Error;

@@ -23,7 +23,7 @@ pub(crate) enum BuildError {
 
 pub(crate) struct PulsarSink {
     transformer: Transformer,
-    encoder: Encoder<()>,
+    encoder: Encoder,
     service: PulsarService<TokioExecutor>,
     config: PulsarSinkConfig,
     topic_template: Template,
@@ -85,7 +85,7 @@ impl PulsarSink {
         let producer_opts = config.build_producer_options();
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build()?;
-        let encoder = Encoder::<()>::new(serializer);
+        let encoder = Encoder::new(serializer);
         let service = PulsarService::new(client, producer_opts, config.producer_name.clone());
         let topic_template = config.topic.clone();
 

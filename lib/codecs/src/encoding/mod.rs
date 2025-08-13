@@ -12,9 +12,9 @@ pub use format::{
     CefSerializerConfig, CsvSerializer, CsvSerializerConfig, GelfSerializer, GelfSerializerConfig,
     JsonSerializer, JsonSerializerConfig, JsonSerializerOptions, LogfmtSerializer,
     LogfmtSerializerConfig, NativeJsonSerializer, NativeJsonSerializerConfig, NativeSerializer,
-    NativeSerializerConfig, ProtobufSerializer, ProtobufSerializerConfig,
-    ProtobufSerializerOptions, RawMessageSerializer, RawMessageSerializerConfig, TextSerializer,
-    TextSerializerConfig,
+    NativeSerializerConfig, ParquetSerializer, ParquetSerializerConfig, ProtobufSerializer,
+    ProtobufSerializerConfig, ProtobufSerializerOptions, RawMessageSerializer,
+    RawMessageSerializerConfig, TextSerializer, TextSerializerConfig,
 };
 pub use framing::{
     BoxedFramer, BoxedFramingError, BytesEncoder, BytesEncoderConfig, CharacterDelimitedEncoder,
@@ -247,6 +247,9 @@ pub enum SerializerConfig {
     /// [protobuf]: https://protobuf.dev/
     Protobuf(ProtobufSerializerConfig),
 
+    /// Encodes events as Parquet.
+    Parquet(ParquetSerializerConfig),
+
     /// No encoding.
     ///
     /// This encoding uses the `message` field of a log event.
@@ -315,6 +318,12 @@ impl From<NativeJsonSerializerConfig> for SerializerConfig {
     }
 }
 
+impl From<ParquetSerializerConfig> for SerializerConfig {
+    fn from(config: ParquetSerializerConfig) -> Self {
+        Self::Parquet(config)
+    }
+}
+
 impl From<ProtobufSerializerConfig> for SerializerConfig {
     fn from(config: ProtobufSerializerConfig) -> Self {
         Self::Protobuf(config)
@@ -333,58 +342,185 @@ impl From<TextSerializerConfig> for SerializerConfig {
     }
 }
 
-impl SerializerConfig {
-    /// Build the `Serializer` from this configuration.
-    pub fn build(&self) -> Result<Serializer, Box<dyn std::error::Error + Send + Sync + 'static>> {
+#[derive(Debug, Clone)]
+pub enum Codec {
+    Stream(Box<StreamingSerializer>, Framer),
+    Batch(BatchSerializer),
+}
+
+impl Codec {
+    /// Gets the appropriate `Content-Type` header for the codec.
+    pub fn content_type(&self) -> &'static str {
         match self {
-            SerializerConfig::Avro { avro } => Ok(Serializer::Avro(
-                AvroSerializerConfig::new(avro.schema.clone()).build()?,
-            )),
-            SerializerConfig::Cef(config) => Ok(Serializer::Cef(config.build()?)),
-            SerializerConfig::Csv(config) => Ok(Serializer::Csv(config.build()?)),
-            SerializerConfig::Gelf => Ok(Serializer::Gelf(GelfSerializerConfig::new().build())),
-            SerializerConfig::Json(config) => Ok(Serializer::Json(config.build())),
-            SerializerConfig::Logfmt => Ok(Serializer::Logfmt(LogfmtSerializerConfig.build())),
-            SerializerConfig::Native => Ok(Serializer::Native(NativeSerializerConfig.build())),
-            SerializerConfig::NativeJson => {
-                Ok(Serializer::NativeJson(NativeJsonSerializerConfig.build()))
+            // Logic for streaming codecs depends on both the serializer and the framer.
+            Codec::Stream(serializer, framer) => match (&**serializer, framer) {
+                (
+                    StreamingSerializer::Json(_) | StreamingSerializer::NativeJson(_),
+                    Framer::NewlineDelimited(_),
+                ) => "application/x-ndjson",
+                (
+                    StreamingSerializer::Gelf(_)
+                    | StreamingSerializer::Json(_)
+                    | StreamingSerializer::NativeJson(_),
+                    Framer::CharacterDelimited(CharacterDelimitedEncoder { delimiter: b',' }),
+                ) => "application/json",
+                _ => "text/plain", // A safe default for other streaming types
+            },
+
+            // Logic for batch codecs depends only on the serializer.
+            Codec::Batch(serializer) => match serializer {
+                BatchSerializer::Parquet(_) => "application/octet-stream",
+            },
+        }
+    }
+
+    /// Gets the prefix that should enclose a batch of events.
+    ///
+    /// This is mainly for "pseudo-batching" streaming formats like JSON array.
+    /// True batch formats like Parquet don't need an external prefix.
+    pub fn batch_prefix(&self) -> &[u8] {
+        match self {
+            Codec::Stream(serializer, framer) => match (&**serializer, framer) {
+                (
+                    StreamingSerializer::Json(_) | StreamingSerializer::NativeJson(_),
+                    Framer::CharacterDelimited(CharacterDelimitedEncoder { delimiter: b',' }),
+                ) => b"[",
+                _ => b"",
+            },
+            Codec::Batch(_) => b"", // Batch formats are self-contained.
+        }
+    }
+
+    /// Gets the suffix that should enclose a batch of events.
+    pub fn batch_suffix(&self, empty_batch: bool) -> &[u8] {
+        match self {
+            Codec::Stream(serializer, framer) => match (&**serializer, framer, empty_batch) {
+                (
+                    StreamingSerializer::Json(_) | StreamingSerializer::NativeJson(_),
+                    Framer::CharacterDelimited(CharacterDelimitedEncoder { delimiter: b',' }),
+                    _,
+                ) => b"]",
+                (StreamingSerializer::Text(_), Framer::NewlineDelimited(_), false) => b"\n",
+                _ => b"",
+            },
+            Codec::Batch(_) => b"", // Batch formats are self-contained.
+        }
+    }
+
+    /// Checks if the underlying serializer supports encoding to a JSON value.
+    ///
+    /// This capability is only relevant for streaming serializers. Batch serializers
+    /// will always return `false`.
+    pub fn supports_json(&self) -> bool {
+        match self {
+            Codec::Stream(serializer, _) => serializer.supports_json(),
+            Codec::Batch(_) => false,
+        }
+    }
+
+    /// Encodes an event and represents it as a JSON value.
+    ///
+    /// Panics if the underlying serializer does not support encoding to JSON. This will
+    /// always panic for `Codec::Batch` variants.
+    pub fn to_json_value(&self, event: Event) -> Result<serde_json::Value, vector_common::Error> {
+        match self {
+            Codec::Stream(serializer, _) => serializer.to_json_value(event),
+            Codec::Batch(_) => {
+                panic!("Batch codecs like Parquet do not support JSON value encoding.")
             }
-            SerializerConfig::Protobuf(config) => Ok(Serializer::Protobuf(config.build()?)),
-            SerializerConfig::RawMessage => {
-                Ok(Serializer::RawMessage(RawMessageSerializerConfig.build()))
+        }
+    }
+}
+
+impl SerializerConfig {
+    pub fn build(&self) -> Result<Codec, BuildError> {
+        match self {
+            Self::Json(config) => {
+                let serializer = StreamingSerializer::Json(config.build());
+                let framer = self.default_stream_framing().build();
+                Ok(Codec::Stream(serializer.into(), framer))
             }
-            SerializerConfig::Text(config) => Ok(Serializer::Text(config.build())),
+
+            Self::Parquet(config) => {
+                let serializer = BatchSerializer::Parquet(config.build()?);
+                Ok(Codec::Batch(serializer))
+            }
+
+            Self::Avro { avro } => {
+                let serializer = StreamingSerializer::Avro(
+                    AvroSerializerConfig::new(avro.schema.clone()).build()?,
+                );
+                let framer = self.default_stream_framing().build();
+                Ok(Codec::Stream(serializer.into(), framer))
+            }
+            Self::Cef(config) => {
+                let serializer = StreamingSerializer::Cef(config.build()?);
+                let framer = self.default_stream_framing().build();
+                Ok(Codec::Stream(serializer.into(), framer))
+            }
+            Self::Csv(config) => {
+                let serializer = StreamingSerializer::Csv(config.build()?);
+                let framer = self.default_stream_framing().build();
+                Ok(Codec::Stream(serializer.into(), framer))
+            }
+            Self::Gelf => {
+                let serializer = StreamingSerializer::Gelf(GelfSerializerConfig::new().build());
+                let framer = self.default_stream_framing().build();
+                Ok(Codec::Stream(serializer.into(), framer))
+            }
+            Self::Logfmt => {
+                let serializer = StreamingSerializer::Logfmt(LogfmtSerializerConfig.build());
+                let framer = self.default_stream_framing().build();
+                Ok(Codec::Stream(serializer.into(), framer))
+            }
+            Self::Native => {
+                let serializer = StreamingSerializer::Native(NativeSerializerConfig.build());
+                let framer = self.default_stream_framing().build();
+                Ok(Codec::Stream(serializer.into(), framer))
+            }
+            Self::NativeJson => {
+                let serializer =
+                    StreamingSerializer::NativeJson(NativeJsonSerializerConfig.build());
+                let framer = self.default_stream_framing().build();
+                Ok(Codec::Stream(serializer.into(), framer))
+            }
+            Self::Protobuf(config) => {
+                let serializer = StreamingSerializer::Protobuf(config.build()?);
+                let framer = self.default_stream_framing().build();
+                Ok(Codec::Stream(serializer.into(), framer))
+            }
+            Self::RawMessage => {
+                let serializer =
+                    StreamingSerializer::RawMessage(RawMessageSerializerConfig.build());
+                let framer = self.default_stream_framing().build();
+                Ok(Codec::Stream(serializer.into(), framer))
+            }
+            Self::Text(config) => {
+                let serializer = StreamingSerializer::Text(config.build());
+                let framer = self.default_stream_framing().build();
+                Ok(Codec::Stream(serializer.into(), framer))
+            }
         }
     }
 
     /// Return an appropriate default framer for the given serializer.
     pub fn default_stream_framing(&self) -> FramingConfig {
         match self {
-            // TODO: Technically, Avro messages are supposed to be framed[1] as a vector of
-            // length-delimited buffers -- `len` as big-endian 32-bit unsigned integer, followed by
-            // `len` bytes -- with a "zero-length buffer" to terminate the overall message... which
-            // our length delimited framer obviously will not do.
-            //
-            // This is OK for now, because the Avro serializer is more ceremonial than anything
-            // else, existing to curry serializer config options to Pulsar's native client, not to
-            // actually serialize the bytes themselves... but we're still exposing this method and
-            // we should do so accurately, even if practically it doesn't need to be.
-            //
-            // [1]: https://avro.apache.org/docs/1.11.1/specification/_print/#message-framing
-            SerializerConfig::Avro { .. }
-            | SerializerConfig::Native
-            | SerializerConfig::Protobuf(_) => {
+            Self::Avro { .. } | Self::Native | Self::Protobuf(_) => {
                 FramingConfig::LengthDelimited(LengthDelimitedEncoderConfig::default())
             }
-            SerializerConfig::Cef(_)
-            | SerializerConfig::Csv(_)
-            | SerializerConfig::Json(_)
-            | SerializerConfig::Logfmt
-            | SerializerConfig::NativeJson
-            | SerializerConfig::RawMessage
-            | SerializerConfig::Text(_) => FramingConfig::NewlineDelimited,
-            SerializerConfig::Gelf => {
+            Self::Cef(_)
+            | Self::Csv(_)
+            | Self::Json(_)
+            | Self::Logfmt
+            | Self::NativeJson
+            | Self::RawMessage
+            | Self::Text(_) => FramingConfig::NewlineDelimited,
+            Self::Gelf => {
                 FramingConfig::CharacterDelimited(CharacterDelimitedEncoderConfig::new(0))
+            }
+            Self::Parquet(_) => {
+                panic!("The 'parquet' codec is a batch-based format and does not support default stream framing.")
             }
         }
     }
@@ -392,45 +528,45 @@ impl SerializerConfig {
     /// The data type of events that are accepted by this `Serializer`.
     pub fn input_type(&self) -> DataType {
         match self {
-            SerializerConfig::Avro { avro } => {
-                AvroSerializerConfig::new(avro.schema.clone()).input_type()
-            }
-            SerializerConfig::Cef(config) => config.input_type(),
-            SerializerConfig::Csv(config) => config.input_type(),
-            SerializerConfig::Gelf => GelfSerializerConfig::input_type(),
-            SerializerConfig::Json(config) => config.input_type(),
-            SerializerConfig::Logfmt => LogfmtSerializerConfig.input_type(),
-            SerializerConfig::Native => NativeSerializerConfig.input_type(),
-            SerializerConfig::NativeJson => NativeJsonSerializerConfig.input_type(),
-            SerializerConfig::Protobuf(config) => config.input_type(),
-            SerializerConfig::RawMessage => RawMessageSerializerConfig.input_type(),
-            SerializerConfig::Text(config) => config.input_type(),
+            Self::Avro { avro } => AvroSerializerConfig::new(avro.schema.clone()).input_type(),
+            Self::Cef(config) => config.input_type(),
+            Self::Csv(config) => config.input_type(),
+            Self::Gelf => GelfSerializerConfig::input_type(),
+            Self::Json(config) => config.input_type(),
+            Self::Logfmt => LogfmtSerializerConfig.input_type(),
+            Self::Native => NativeSerializerConfig.input_type(),
+            Self::NativeJson => NativeJsonSerializerConfig.input_type(),
+            Self::Parquet(config) => config.input_type(), // Added Parquet
+            Self::Protobuf(config) => config.input_type(),
+            Self::RawMessage => RawMessageSerializerConfig.input_type(),
+            Self::Text(config) => config.input_type(),
         }
     }
 
     /// The schema required by the serializer.
     pub fn schema_requirement(&self) -> schema::Requirement {
         match self {
-            SerializerConfig::Avro { avro } => {
+            Self::Avro { avro } => {
                 AvroSerializerConfig::new(avro.schema.clone()).schema_requirement()
             }
-            SerializerConfig::Cef(config) => config.schema_requirement(),
-            SerializerConfig::Csv(config) => config.schema_requirement(),
-            SerializerConfig::Gelf => GelfSerializerConfig::schema_requirement(),
-            SerializerConfig::Json(config) => config.schema_requirement(),
-            SerializerConfig::Logfmt => LogfmtSerializerConfig.schema_requirement(),
-            SerializerConfig::Native => NativeSerializerConfig.schema_requirement(),
-            SerializerConfig::NativeJson => NativeJsonSerializerConfig.schema_requirement(),
-            SerializerConfig::Protobuf(config) => config.schema_requirement(),
-            SerializerConfig::RawMessage => RawMessageSerializerConfig.schema_requirement(),
-            SerializerConfig::Text(config) => config.schema_requirement(),
+            Self::Cef(config) => config.schema_requirement(),
+            Self::Csv(config) => config.schema_requirement(),
+            Self::Gelf => GelfSerializerConfig::schema_requirement(),
+            Self::Json(config) => config.schema_requirement(),
+            Self::Logfmt => LogfmtSerializerConfig.schema_requirement(),
+            Self::Native => NativeSerializerConfig.schema_requirement(),
+            Self::NativeJson => NativeJsonSerializerConfig.schema_requirement(),
+            Self::Parquet(config) => config.schema_requirement(), // Added Parquet
+            Self::Protobuf(config) => config.schema_requirement(),
+            Self::RawMessage => RawMessageSerializerConfig.schema_requirement(),
+            Self::Text(config) => config.schema_requirement(),
         }
     }
 }
 
 /// Serialize structured events as bytes.
 #[derive(Debug, Clone)]
-pub enum Serializer {
+pub enum StreamingSerializer {
     /// Uses an `AvroSerializer` for serialization.
     Avro(AvroSerializer),
     /// Uses a `CefSerializer` for serialization.
@@ -455,19 +591,41 @@ pub enum Serializer {
     Text(TextSerializer),
 }
 
-impl Serializer {
+impl tokio_util::codec::Encoder<Event> for StreamingSerializer {
+    type Error = vector_common::Error;
+
+    fn encode(&mut self, event: Event, buffer: &mut BytesMut) -> Result<(), Self::Error> {
+        match self {
+            Self::Avro(s) => s.encode(event, buffer),
+            Self::Cef(s) => s.encode(event, buffer),
+            Self::Csv(s) => s.encode(event, buffer),
+            Self::Gelf(s) => s.encode(event, buffer),
+            Self::Json(s) => s.encode(event, buffer),
+            Self::Logfmt(s) => s.encode(event, buffer),
+            Self::Native(s) => s.encode(event, buffer),
+            Self::NativeJson(s) => s.encode(event, buffer),
+            Self::Protobuf(s) => s.encode(event, buffer),
+            Self::RawMessage(s) => s.encode(event, buffer),
+            Self::Text(s) => s.encode(event, buffer),
+        }
+    }
+}
+
+impl StreamingSerializer {
     /// Check if the serializer supports encoding an event to JSON via `Serializer::to_json_value`.
     pub fn supports_json(&self) -> bool {
         match self {
-            Serializer::Json(_) | Serializer::NativeJson(_) | Serializer::Gelf(_) => true,
-            Serializer::Avro(_)
-            | Serializer::Cef(_)
-            | Serializer::Csv(_)
-            | Serializer::Logfmt(_)
-            | Serializer::Text(_)
-            | Serializer::Native(_)
-            | Serializer::Protobuf(_)
-            | Serializer::RawMessage(_) => false,
+            StreamingSerializer::Json(_)
+            | StreamingSerializer::NativeJson(_)
+            | StreamingSerializer::Gelf(_) => true,
+            StreamingSerializer::Avro(_)
+            | StreamingSerializer::Cef(_)
+            | StreamingSerializer::Csv(_)
+            | StreamingSerializer::Logfmt(_)
+            | StreamingSerializer::Text(_)
+            | StreamingSerializer::Native(_)
+            | StreamingSerializer::Protobuf(_)
+            | StreamingSerializer::RawMessage(_) => false,
         }
     }
 
@@ -479,105 +637,113 @@ impl Serializer {
     /// if you need to determine the capability to encode to JSON at runtime.
     pub fn to_json_value(&self, event: Event) -> Result<serde_json::Value, vector_common::Error> {
         match self {
-            Serializer::Gelf(serializer) => serializer.to_json_value(event),
-            Serializer::Json(serializer) => serializer.to_json_value(event),
-            Serializer::NativeJson(serializer) => serializer.to_json_value(event),
-            Serializer::Avro(_)
-            | Serializer::Cef(_)
-            | Serializer::Csv(_)
-            | Serializer::Logfmt(_)
-            | Serializer::Text(_)
-            | Serializer::Native(_)
-            | Serializer::Protobuf(_)
-            | Serializer::RawMessage(_) => {
+            StreamingSerializer::Gelf(serializer) => serializer.to_json_value(event),
+            StreamingSerializer::Json(serializer) => serializer.to_json_value(event),
+            StreamingSerializer::NativeJson(serializer) => serializer.to_json_value(event),
+            StreamingSerializer::Avro(_)
+            | StreamingSerializer::Cef(_)
+            | StreamingSerializer::Csv(_)
+            | StreamingSerializer::Logfmt(_)
+            | StreamingSerializer::Text(_)
+            | StreamingSerializer::Native(_)
+            | StreamingSerializer::Protobuf(_)
+            | StreamingSerializer::RawMessage(_) => {
                 panic!("Serializer does not support JSON")
             }
         }
     }
 }
 
-impl From<AvroSerializer> for Serializer {
+impl From<AvroSerializer> for StreamingSerializer {
     fn from(serializer: AvroSerializer) -> Self {
         Self::Avro(serializer)
     }
 }
 
-impl From<CefSerializer> for Serializer {
+impl From<CefSerializer> for StreamingSerializer {
     fn from(serializer: CefSerializer) -> Self {
         Self::Cef(serializer)
     }
 }
 
-impl From<CsvSerializer> for Serializer {
+impl From<CsvSerializer> for StreamingSerializer {
     fn from(serializer: CsvSerializer) -> Self {
         Self::Csv(serializer)
     }
 }
 
-impl From<GelfSerializer> for Serializer {
+impl From<GelfSerializer> for StreamingSerializer {
     fn from(serializer: GelfSerializer) -> Self {
         Self::Gelf(serializer)
     }
 }
 
-impl From<JsonSerializer> for Serializer {
+impl From<JsonSerializer> for StreamingSerializer {
     fn from(serializer: JsonSerializer) -> Self {
         Self::Json(serializer)
     }
 }
 
-impl From<LogfmtSerializer> for Serializer {
+impl From<LogfmtSerializer> for StreamingSerializer {
     fn from(serializer: LogfmtSerializer) -> Self {
         Self::Logfmt(serializer)
     }
 }
 
-impl From<NativeSerializer> for Serializer {
+impl From<NativeSerializer> for StreamingSerializer {
     fn from(serializer: NativeSerializer) -> Self {
         Self::Native(serializer)
     }
 }
 
-impl From<NativeJsonSerializer> for Serializer {
+impl From<NativeJsonSerializer> for StreamingSerializer {
     fn from(serializer: NativeJsonSerializer) -> Self {
         Self::NativeJson(serializer)
     }
 }
 
-impl From<ProtobufSerializer> for Serializer {
+impl From<ProtobufSerializer> for StreamingSerializer {
     fn from(serializer: ProtobufSerializer) -> Self {
         Self::Protobuf(serializer)
     }
 }
 
-impl From<RawMessageSerializer> for Serializer {
+impl From<RawMessageSerializer> for StreamingSerializer {
     fn from(serializer: RawMessageSerializer) -> Self {
         Self::RawMessage(serializer)
     }
 }
 
-impl From<TextSerializer> for Serializer {
+impl From<TextSerializer> for StreamingSerializer {
     fn from(serializer: TextSerializer) -> Self {
         Self::Text(serializer)
     }
 }
 
-impl tokio_util::codec::Encoder<Event> for Serializer {
+pub trait BatchEncoder {
+    type Error;
+
+    fn encode_batch(&mut self, events: &[Event], buffer: &mut BytesMut) -> Result<(), Self::Error>;
+}
+
+#[derive(Debug, Clone)]
+pub enum BatchSerializer {
+    /// Uses a `ParquetSerializer` for serialization.
+    Parquet(ParquetSerializer),
+}
+
+impl BatchEncoder for BatchSerializer {
     type Error = vector_common::Error;
 
-    fn encode(&mut self, event: Event, buffer: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode_batch(&mut self, events: &[Event], buffer: &mut BytesMut) -> Result<(), Self::Error> {
         match self {
-            Serializer::Avro(serializer) => serializer.encode(event, buffer),
-            Serializer::Cef(serializer) => serializer.encode(event, buffer),
-            Serializer::Csv(serializer) => serializer.encode(event, buffer),
-            Serializer::Gelf(serializer) => serializer.encode(event, buffer),
-            Serializer::Json(serializer) => serializer.encode(event, buffer),
-            Serializer::Logfmt(serializer) => serializer.encode(event, buffer),
-            Serializer::Native(serializer) => serializer.encode(event, buffer),
-            Serializer::NativeJson(serializer) => serializer.encode(event, buffer),
-            Serializer::Protobuf(serializer) => serializer.encode(event, buffer),
-            Serializer::RawMessage(serializer) => serializer.encode(event, buffer),
-            Serializer::Text(serializer) => serializer.encode(event, buffer),
+            Self::Parquet(s) => s.encode_batch(events, buffer),
         }
+    }
+}
+
+impl From<ParquetSerializer> for BatchSerializer {
+    fn from(serializer: ParquetSerializer) -> Self {
+        Self::Parquet(serializer)
     }
 }

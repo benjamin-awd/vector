@@ -130,7 +130,7 @@ impl RequestBuilder<(PartitionKey, Vec<LokiRecord>)> for LokiRequestBuilder {
 pub(super) struct EventEncoder {
     key_partitioner: KeyPartitioner,
     transformer: Transformer,
-    encoder: Encoder<()>,
+    encoder: Encoder,
     labels: HashMap<Template, Template>,
     remove_label_fields: bool,
     structured_metadata: HashMap<Template, Template>,
@@ -468,7 +468,7 @@ impl LokiSink {
 
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build()?;
-        let encoder = Encoder::<()>::new(serializer);
+        let encoder = Encoder::new(serializer);
         let batch_encoder = match config.compression {
             Compression::Snappy => LokiBatchEncoder(LokiBatchEncoding::Protobuf),
             _ => LokiBatchEncoder(LokiBatchEncoding::Json),
@@ -581,7 +581,7 @@ mod tests {
         let mut encoder = EventEncoder {
             key_partitioner: KeyPartitioner::new(None),
             transformer: Default::default(),
-            encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
+            encoder: Encoder::new(JsonSerializerConfig::default().build().into()),
             labels: HashMap::default(),
             structured_metadata: HashMap::default(),
             remove_label_fields: false,
@@ -626,7 +626,7 @@ mod tests {
         let mut encoder = EventEncoder {
             key_partitioner: KeyPartitioner::new(None),
             transformer: Default::default(),
-            encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
+            encoder: Encoder::new(JsonSerializerConfig::default().build().into()),
             labels,
             structured_metadata: HashMap::default(),
             remove_label_fields: false,
@@ -678,7 +678,7 @@ mod tests {
         let mut encoder = EventEncoder {
             key_partitioner: KeyPartitioner::new(None),
             transformer: Default::default(),
-            encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
+            encoder: Encoder::new(JsonSerializerConfig::default().build().into()),
             labels,
             structured_metadata: HashMap::default(),
             remove_label_fields: false,
@@ -730,7 +730,7 @@ mod tests {
         let mut encoder = EventEncoder {
             key_partitioner: KeyPartitioner::new(None),
             transformer: Default::default(),
-            encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
+            encoder: Encoder::new(JsonSerializerConfig::default().build().into()),
             labels,
             structured_metadata: HashMap::default(),
             remove_label_fields: false,
@@ -770,7 +770,7 @@ mod tests {
         let mut encoder = EventEncoder {
             key_partitioner: KeyPartitioner::new(None),
             transformer: Default::default(),
-            encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
+            encoder: Encoder::new(JsonSerializerConfig::default().build().into()),
             labels,
             structured_metadata: HashMap::default(),
             remove_label_fields: false,
@@ -793,7 +793,7 @@ mod tests {
         let mut encoder = EventEncoder {
             key_partitioner: KeyPartitioner::new(None),
             transformer: Default::default(),
-            encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
+            encoder: Encoder::new(JsonSerializerConfig::default().build().into()),
             labels: HashMap::default(),
             structured_metadata: HashMap::default(),
             remove_label_fields: false,
@@ -825,7 +825,7 @@ mod tests {
         let mut encoder = EventEncoder {
             key_partitioner: KeyPartitioner::new(None),
             transformer: Default::default(),
-            encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
+            encoder: Encoder::new(JsonSerializerConfig::default().build().into()),
             labels,
             structured_metadata: HashMap::default(),
             remove_label_fields: true,
@@ -863,7 +863,7 @@ mod tests {
         let mut encoder = EventEncoder {
             key_partitioner: KeyPartitioner::new(None),
             transformer: Default::default(),
-            encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
+            encoder: Encoder::new(JsonSerializerConfig::default().build().into()),
             labels: HashMap::default(),
             structured_metadata,
             remove_label_fields: false,
@@ -918,7 +918,7 @@ mod tests {
         let mut encoder = EventEncoder {
             key_partitioner: KeyPartitioner::new(None),
             transformer: Default::default(),
-            encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
+            encoder: Encoder::new(JsonSerializerConfig::default().build().into()),
             labels: HashMap::default(),
             structured_metadata: HashMap::default(),
             remove_label_fields: false,

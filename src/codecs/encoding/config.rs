@@ -1,8 +1,6 @@
 use crate::codecs::Transformer;
-use vector_lib::codecs::{
-    encoding::{Framer, FramingConfig, Serializer, SerializerConfig},
-    CharacterDelimitedEncoder, LengthDelimitedEncoder, NewlineDelimitedEncoder,
-};
+use vector_lib::codecs::encoding::Codec;
+use vector_lib::codecs::encoding::{FramingConfig, SerializerConfig};
 use vector_lib::configurable::configurable_component;
 
 /// Encoding configuration.
@@ -27,18 +25,19 @@ impl EncodingConfig {
         }
     }
 
+    /// Returns a reference to the underlying [`SerializerConfig`]
+    /// that defines how events are serialized before optional framing.
+    pub fn encoding(&self) -> &SerializerConfig {
+        &self.encoding
+    }
+
     /// Build a `Transformer` that applies the encoding rules to an event before serialization.
     pub fn transformer(&self) -> Transformer {
         self.transformer.clone()
     }
 
-    /// Get the encoding configuration.
-    pub const fn config(&self) -> &SerializerConfig {
-        &self.encoding
-    }
-
-    /// Build the `Serializer` for this config.
-    pub fn build(&self) -> crate::Result<Serializer> {
+    /// Build the `Codec` for this config.
+    pub fn build(&self) -> crate::Result<Codec> {
         self.encoding.build()
     }
 }
@@ -68,68 +67,33 @@ pub struct EncodingConfigWithFraming {
 }
 
 impl EncodingConfigWithFraming {
-    /// Creates a new `EncodingConfigWithFraming` with the provided `FramingConfig`,
-    /// `SerializerConfig` and `Transformer`.
-    pub const fn new(
-        framing: Option<FramingConfig>,
-        encoding: SerializerConfig,
-        transformer: Transformer,
-    ) -> Self {
-        Self {
-            framing,
-            encoding: EncodingConfig {
-                encoding,
-                transformer,
-            },
-        }
-    }
-
     /// Build a `Transformer` that applies the encoding rules to an event before serialization.
     pub fn transformer(&self) -> Transformer {
         self.encoding.transformer.clone()
     }
 
-    /// Get the encoding configuration.
-    pub const fn config(&self) -> (&Option<FramingConfig>, &SerializerConfig) {
-        (&self.framing, &self.encoding.encoding)
-    }
+    /// Build the `Codec` for this config.
+    pub fn build(&self) -> crate::Result<Codec> {
+        // Build the base codec, which will have the default framer for streaming types.
+        let base_codec = self.encoding.build()?;
 
-    /// Build the `Framer` and `Serializer` for this config.
-    pub fn build(&self, sink_type: SinkType) -> crate::Result<(Framer, Serializer)> {
-        let framer = self.framing.as_ref().map(|framing| framing.build());
-        let serializer = self.encoding.build()?;
-
-        let framer = match (framer, &serializer) {
-            (Some(framer), _) => framer,
-            (None, Serializer::Json(_)) => match sink_type {
-                SinkType::StreamBased => NewlineDelimitedEncoder::default().into(),
-                SinkType::MessageBased => CharacterDelimitedEncoder::new(b',').into(),
-            },
-            (None, Serializer::Avro(_) | Serializer::Native(_)) => {
-                LengthDelimitedEncoder::default().into()
+        // If the user provided a `framing` override, apply it.
+        if let Some(framing_override) = &self.framing {
+            match base_codec {
+                Codec::Stream(serializer, _default_framer) => {
+                    // Replace the default framer with the user's override.
+                    let new_framer = framing_override.build();
+                    Ok(Codec::Stream(serializer, new_framer))
+                }
+                Codec::Batch(_) => Err(
+                    "The configured codec is a batch format and does not support custom framing."
+                        .into(),
+                ),
             }
-            (None, Serializer::Gelf(_)) => {
-                // Graylog/GELF always uses null byte delimiter on TCP, see
-                // https://github.com/Graylog2/graylog2-server/issues/1240
-                CharacterDelimitedEncoder::new(0).into()
-            }
-            (None, Serializer::Protobuf(_)) => {
-                // Protobuf uses length-delimited messages, see:
-                // https://developers.google.com/protocol-buffers/docs/techniques#streaming
-                LengthDelimitedEncoder::default().into()
-            }
-            (
-                None,
-                Serializer::Cef(_)
-                | Serializer::Csv(_)
-                | Serializer::Logfmt(_)
-                | Serializer::NativeJson(_)
-                | Serializer::RawMessage(_)
-                | Serializer::Text(_),
-            ) => NewlineDelimitedEncoder::default().into(),
-        };
-
-        Ok((framer, serializer))
+        } else {
+            // No override, just return the codec with its default framing.
+            Ok(base_codec)
+        }
     }
 }
 
@@ -160,7 +124,7 @@ mod test {
 
     use super::*;
     use crate::codecs::encoding::TimestampFormat;
-
+    use vector_lib::codecs::encoding::{Framer, StreamingSerializer};
     #[test]
     fn deserialize_encoding_config() {
         let string = r#"
@@ -172,13 +136,18 @@ mod test {
             }
         "#;
 
-        let encoding = serde_json::from_str::<EncodingConfig>(string).unwrap();
-        let serializer = encoding.config();
+        let encoding_config = serde_json::from_str::<EncodingConfig>(string).unwrap();
 
-        assert!(matches!(serializer, SerializerConfig::Json(_)));
+        let codec = encoding_config.build().unwrap();
 
-        let transformer = encoding.transformer();
+        if let Codec::Stream(serializer, framer) = codec {
+            assert!(matches!(serializer.as_ref(), StreamingSerializer::Json(_)));
+            assert!(matches!(framer, Framer::NewlineDelimited(_)));
+        } else {
+            panic!("Expected a streaming codec!");
+        }
 
+        let transformer = encoding_config.transformer();
         assert_eq!(
             transformer.only_fields(),
             &Some(vec![ConfigValuePath(parse_value_path("a.b[0]").unwrap())])
@@ -188,7 +157,7 @@ mod test {
     }
 
     #[test]
-    fn deserialize_encoding_config_with_framing() {
+    fn deserialize_and_build_config_with_framing() {
         let string = r#"
             {
                 "framing": {
@@ -203,13 +172,19 @@ mod test {
             }
         "#;
 
-        let encoding = serde_json::from_str::<EncodingConfigWithFraming>(string).unwrap();
-        let (framing, serializer) = encoding.config();
+        let encoding_config = serde_json::from_str::<EncodingConfigWithFraming>(string).unwrap();
 
-        assert!(matches!(framing, Some(FramingConfig::NewlineDelimited)));
-        assert!(matches!(serializer, SerializerConfig::Json(_)));
+        let codec = encoding_config.build().unwrap();
 
-        let transformer = encoding.transformer();
+        assert!(matches!(codec, Codec::Stream(_, _)));
+        if let Codec::Stream(serializer, framer) = codec {
+            assert!(matches!(serializer.as_ref(), StreamingSerializer::Json(_)));
+            assert!(matches!(framer, Framer::NewlineDelimited(_)));
+        } else {
+            panic!("Expected a streaming codec!");
+        }
+
+        let transformer = encoding_config.transformer();
 
         assert_eq!(
             transformer.only_fields(),
@@ -232,14 +207,18 @@ mod test {
             }
         "#;
 
-        let encoding = serde_json::from_str::<EncodingConfigWithFraming>(string).unwrap();
-        let (framing, serializer) = encoding.config();
+        let encoding_config = serde_json::from_str::<EncodingConfigWithFraming>(string).unwrap();
+        let codec = encoding_config.build().unwrap();
 
-        assert!(framing.is_none());
-        assert!(matches!(serializer, SerializerConfig::Json(_)));
+        if let Codec::Stream(serializer, framer) = codec {
+            assert!(matches!(serializer.as_ref(), StreamingSerializer::Json(_)));
+            // When no framing is specified, the default for JSON is NewlineDelimited
+            assert!(matches!(framer, Framer::NewlineDelimited(_)));
+        } else {
+            panic!("Expected a streaming codec!");
+        }
 
-        let transformer = encoding.transformer();
-
+        let transformer = encoding_config.transformer();
         assert_eq!(
             transformer.only_fields(),
             &Some(vec![ConfigValuePath(parse_value_path("a.b[0]").unwrap())])

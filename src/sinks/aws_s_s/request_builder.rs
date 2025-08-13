@@ -23,7 +23,7 @@ pub(super) struct SSMetadata {
 
 #[derive(Clone)]
 pub(super) struct SSRequestBuilder {
-    encoder: (Transformer, Encoder<()>),
+    encoder: (Transformer, Encoder),
     message_group_id: Option<Template>,
     message_deduplication_id: Option<Template>,
 }
@@ -36,7 +36,7 @@ impl SSRequestBuilder {
     ) -> crate::Result<Self> {
         let transformer = encoding_config.transformer();
         let serializer = encoding_config.build()?;
-        let encoder = Encoder::<()>::new(serializer);
+        let encoder = Encoder::new(serializer);
 
         Ok(Self {
             encoder: (transformer, encoder),
@@ -49,7 +49,7 @@ impl SSRequestBuilder {
 impl RequestBuilder<Event> for SSRequestBuilder {
     type Metadata = SSMetadata;
     type Events = Event;
-    type Encoder = (Transformer, Encoder<()>);
+    type Encoder = (Transformer, Encoder);
     type Payload = Bytes;
     type Request = SendMessageEntry;
     type Error = std::io::Error;

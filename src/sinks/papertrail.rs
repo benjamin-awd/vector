@@ -97,7 +97,7 @@ impl SinkConfig for PapertrailConfig {
 
         let transformer = self.encoding.transformer();
         let serializer = self.encoding.build()?;
-        let encoder = Encoder::<()>::new(serializer);
+        let encoder = Encoder::new(serializer);
 
         sink_config.build(
             Transformer::default(),
@@ -127,7 +127,7 @@ struct PapertrailEncoder {
     pid: u32,
     process: Template,
     transformer: Transformer,
-    encoder: Encoder<()>,
+    encoder: Encoder,
 }
 
 impl tokio_util::codec::Encoder<Event> for PapertrailEncoder {
@@ -232,7 +232,7 @@ mod tests {
             pid: 0,
             process: Template::try_from("{{ process }}").unwrap(),
             transformer: Transformer::new(None, Some(vec!["magic".into()]), None).unwrap(),
-            encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
+            encoder: Encoder::new(JsonSerializerConfig::default().build().into()),
         };
 
         let mut bytes = BytesMut::new();

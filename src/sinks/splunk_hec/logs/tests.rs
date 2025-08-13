@@ -159,7 +159,7 @@ fn splunk_process_log_event() {
 fn hec_encoder(encoding: EncodingConfig) -> HecLogsEncoder {
     let transformer = encoding.transformer();
     let serializer = encoding.build().unwrap();
-    let encoder = Encoder::<()>::new(serializer);
+    let encoder = Encoder::new(serializer);
     HecLogsEncoder {
         transformer,
         encoder,

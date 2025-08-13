@@ -56,7 +56,7 @@ use super::{
 pub struct WebSocketListenerSink {
     tls: MaybeTlsSettings,
     transformer: Transformer,
-    encoder: Encoder<()>,
+    encoder: Encoder,
     address: SocketAddr,
     auth: Option<HttpServerAuthMatcher>,
     extra_tags_config: HashMap<String, ExtraMetricTagsConfig>,
@@ -69,7 +69,7 @@ impl WebSocketListenerSink {
         let tls = MaybeTlsSettings::from_config(config.tls.as_ref(), true)?;
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build()?;
-        let encoder = Encoder::<()>::new(serializer);
+        let encoder = Encoder::new(serializer);
         let auth = config
             .auth
             .map(|config| config.build(&cx.enrichment_tables))

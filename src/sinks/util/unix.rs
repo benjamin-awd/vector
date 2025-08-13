@@ -325,7 +325,7 @@ mod tests {
         assert!(UnixSinkConfig::new(good_path.clone())
             .build(
                 Default::default(),
-                Encoder::<()>::new(TextSerializerConfig::default().build().into()),
+                Encoder::new(TextSerializerConfig::default().build().into()),
                 UnixMode::Stream
             )
             .unwrap()
@@ -336,7 +336,7 @@ mod tests {
             UnixSinkConfig::new(good_path.clone())
                 .build(
                     Default::default(),
-                    Encoder::<()>::new(TextSerializerConfig::default().build().into()),
+                    Encoder::new(TextSerializerConfig::default().build().into()),
                     UnixMode::Datagram
                 )
                 .unwrap()
@@ -350,7 +350,7 @@ mod tests {
         assert!(UnixSinkConfig::new(bad_path.clone())
             .build(
                 Default::default(),
-                Encoder::<()>::new(TextSerializerConfig::default().build().into()),
+                Encoder::new(TextSerializerConfig::default().build().into()),
                 UnixMode::Stream
             )
             .unwrap()
@@ -360,7 +360,7 @@ mod tests {
         assert!(UnixSinkConfig::new(bad_path.clone())
             .build(
                 Default::default(),
-                Encoder::<()>::new(TextSerializerConfig::default().build().into()),
+                Encoder::new(TextSerializerConfig::default().build().into()),
                 UnixMode::Datagram
             )
             .unwrap()

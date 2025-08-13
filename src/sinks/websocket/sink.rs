@@ -30,7 +30,7 @@ use crate::{
 
 pub struct WebSocketSink {
     transformer: Transformer,
-    encoder: Encoder<()>,
+    encoder: Encoder,
     connector: WebSocketConnector,
     ping_interval: Option<NonZeroU64>,
     ping_timeout: Option<NonZeroU64>,
@@ -43,7 +43,7 @@ impl WebSocketSink {
     ) -> crate::Result<Self> {
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build()?;
-        let encoder = Encoder::<()>::new(serializer);
+        let encoder = Encoder::new(serializer);
 
         Ok(Self {
             transformer,

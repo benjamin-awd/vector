@@ -8,6 +8,7 @@ use vector_lib::{
     event::{EventFinalizers, Finalizable},
     ByteSizeOf,
 };
+use vector_lib::codecs::encoding::Codec;
 
 use super::TemplateRenderingError;
 use crate::{
@@ -54,7 +55,7 @@ pub struct CloudwatchRequestBuilder {
     pub group_template: Template,
     pub stream_template: Template,
     pub transformer: Transformer,
-    pub encoder: Encoder<()>,
+    pub codec: Codec,
 }
 
 impl CloudwatchRequestBuilder {
@@ -95,10 +96,20 @@ impl CloudwatchRequestBuilder {
 
         let builder = RequestMetadataBuilder::from_event(&event);
 
-        if self.encoder.encode(event, &mut message_bytes).is_err() {
-            // The encoder handles internal event emission for Error and EventsDropped.
-            return None;
+        match &mut self.codec {
+            Codec::Stream(serializer, _framer) => {
+                // The framer is ignored because CloudWatch has its own format.
+                if serializer.encode(event, &mut message_bytes).is_err() {
+                    // The encoder handles internal event emission.
+                    return None;
+                }
+            }
+            Codec::Batch(_) => {
+                error!("Invalid codec configuration: `aws_cloudwatch_logs` sink does not support batch codecs.");
+                return None;
+            }
         }
+
         let message = String::from_utf8_lossy(&message_bytes).to_string();
 
         if message.len() >= MAX_MESSAGE_SIZE {

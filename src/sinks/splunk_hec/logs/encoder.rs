@@ -56,7 +56,7 @@ impl<'a> HecData<'a> {
 #[derive(Debug, Clone)]
 pub struct HecLogsEncoder {
     pub transformer: Transformer,
-    pub encoder: crate::codecs::Encoder<()>,
+    pub encoder: crate::codecs::Encoder,
     pub auto_extract_timestamp: bool,
 }
 

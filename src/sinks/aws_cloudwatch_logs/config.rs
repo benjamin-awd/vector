@@ -3,6 +3,7 @@ use futures::FutureExt;
 use serde::{de, Deserialize, Deserializer};
 use std::collections::HashMap;
 use tower::ServiceBuilder;
+use vector_lib::codecs::encoding::Codec;
 use vector_lib::codecs::JsonSerializerConfig;
 use vector_lib::configurable::configurable_component;
 use vector_lib::schema;
@@ -206,6 +207,8 @@ impl SinkConfig for CloudwatchLogsSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let batcher_settings = self.batch.into_batcher_settings()?;
         let request_settings = self.request.tower.into_settings();
+
+        let codec = self.encoding.build()?;
         let client = self.create_client(cx.proxy()).await?;
         let svc = ServiceBuilder::new()
             .settings(request_settings, CloudwatchRetryLogic::new())
@@ -214,8 +217,6 @@ impl SinkConfig for CloudwatchLogsSinkConfig {
                 client.clone(),
             )?);
         let transformer = self.encoding.transformer();
-        let serializer = self.encoding.build()?;
-        let encoder = Encoder::<()>::new(serializer);
         let healthcheck = healthcheck(self.clone(), client).boxed();
         let sink = CloudwatchSink {
             batcher_settings,
@@ -223,9 +224,8 @@ impl SinkConfig for CloudwatchLogsSinkConfig {
                 group_template: self.group_name.clone(),
                 stream_template: self.stream_name.clone(),
                 transformer,
-                encoder,
+                codec,
             },
-
             service: svc,
         };
 
@@ -236,7 +236,7 @@ impl SinkConfig for CloudwatchLogsSinkConfig {
         let requirement =
             schema::Requirement::empty().optional_meaning("timestamp", Kind::timestamp());
 
-        Input::new(self.encoding.config().input_type() & DataType::Log)
+        Input::new(self.encoding.encoding().input_type() & DataType::Log)
             .with_schema_requirement(requirement)
     }
 

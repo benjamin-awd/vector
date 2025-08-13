@@ -4,6 +4,7 @@ use bytes::Bytes;
 use vector_lib::request_metadata::{GroupedCountByteSize, RequestMetadata};
 
 use super::{encoding::Encoder, metadata::RequestMetadataBuilder, Compression, Compressor};
+use bytes::BytesMut;
 
 pub fn default_request_builder_concurrency_limit() -> NonZeroUsize {
     if let Some(limit) = std::env::var("VECTOR_EXPERIMENTAL_REQUEST_BUILDER_CONCURRENCY")
@@ -61,12 +62,10 @@ impl<P> EncodeResult<P> {
         self.payload
     }
 }
-
 /// Generalized interface for defining how a batch of events will be turned into a request.
 pub trait RequestBuilder<Input> {
     type Metadata;
-    type Events;
-    type Encoder: Encoder<Self::Events>;
+    type Events: AsRef<[Event]>;
     type Payload: From<Bytes> + AsRef<[u8]>;
     type Request;
     type Error: From<io::Error>;
@@ -74,37 +73,14 @@ pub trait RequestBuilder<Input> {
     /// Gets the compression algorithm used by this request builder.
     fn compression(&self) -> Compression;
 
-    /// Gets the encoder used by this request builder.
-    fn encoder(&self) -> &Self::Encoder;
+    /// Gets the transformer used by this request builder.
+    fn transformer(&self) -> &Transformer;
+
+    /// Gets a mutable reference to the codec.
+    fn codec(&mut self) -> &mut Codec;
 
     /// Splits apart the input into the metadata and event portions.
-    ///
-    /// The metadata should be any information that needs to be passed back to `build_request`
-    /// as-is, such as event finalizers, while the events are the actual events to process.
     fn split_input(&self, input: Input) -> (Self::Metadata, RequestMetadataBuilder, Self::Events);
-
-    fn encode_events(
-        &self,
-        events: Self::Events,
-    ) -> Result<EncodeResult<Self::Payload>, Self::Error> {
-        // TODO: Should we add enough bounds on `Self::Events` that we could automatically derive event count/event byte
-        // size, and then we could generate `BatchRequestMetadata` and pass it directly to `build_request`? That would
-        // obviate needing to wrap `payload` in `EncodeResult`, although practically speaking.. the name would be kind
-        // of clash-y with `Self::Metadata`.
-        let mut compressor = Compressor::from(self.compression());
-        let is_compressed = compressor.is_compressed();
-        let (_, json_size) = self.encoder().encode_input(events, &mut compressor)?;
-
-        let payload = compressor.into_inner().freeze();
-        let result = if is_compressed {
-            let compressed_byte_size = payload.len();
-            EncodeResult::compressed(payload.into(), compressed_byte_size, json_size)
-        } else {
-            EncodeResult::uncompressed(payload.into(), json_size)
-        };
-
-        Ok(result)
-    }
 
     /// Builds a request for the given metadata and payload.
     fn build_request(
@@ -113,6 +89,48 @@ pub trait RequestBuilder<Input> {
         request_metadata: RequestMetadata,
         payload: EncodeResult<Self::Payload>,
     ) -> Self::Request;
+
+    /// Splits apart the input into the metadata and event portions.
+    ///
+    /// The metadata should be any information that needs to be passed back to `build_request`
+    /// as-is, such as event finalizers, while the events are the actual events to process.
+    fn encode_events(
+        &mut self,
+        events: Self::Events,
+    ) -> Result<EncodeResult<Self::Payload>, Self::Error> {
+        let events_slice = events.as_ref();
+
+        // 1. Transform events and calculate metrics first.
+        let mut transformed_events = Vec::with_capacity(events_slice.len());
+        let mut byte_size = telemetry().create_request_count_byte_size();
+        for event in events_slice.iter() {
+            let mut transformed_event = event.clone();
+            self.transformer().transform(&mut transformed_event);
+            byte_size.add_event(&transformed_event, transformed_event.estimated_json_encoded_size_of());
+            transformed_events.push(transformed_event);
+        }
+
+        // 2. Encode the transformed events into a buffer using the Codec.
+        let mut buffer = BytesMut::new();
+        self.codec()
+            .encode_batch(&transformed_events, &mut buffer)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let uncompressed_byte_size = buffer.len();
+
+        // 3. Compress the resulting buffer.
+        let mut compressor = Compressor::from(self.compression());
+        compressor.write_all(&buffer)?;
+        let payload = compressor.into_inner().freeze();
+
+        // 4. Build and return the final result.
+        let result = if self.compression().is_compressed() {
+            EncodeResult::compressed(payload.into(), uncompressed_byte_size, byte_size)
+        } else {
+            EncodeResult::uncompressed(payload.into(), byte_size)
+        };
+
+        Ok(result)
+    }
 }
 
 /// Generalized interface for defining how a batch of events will incrementally be turned into requests.

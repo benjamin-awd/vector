@@ -13,7 +13,7 @@ pub(super) struct MqttMetadata {
 }
 
 pub(super) struct MqttEncoder {
-    pub(super) encoder: crate::codecs::Encoder<()>,
+    pub(super) encoder: crate::codecs::Encoder,
     pub(super) transformer: crate::codecs::Transformer,
 }
 

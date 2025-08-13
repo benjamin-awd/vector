@@ -252,7 +252,7 @@ impl RedisConnection {
 
 pub(super) struct RedisSink {
     request: TowerRequestConfig<RedisTowerRequestConfigDefaults>,
-    encoder: crate::codecs::Encoder<()>,
+    encoder: crate::codecs::Encoder,
     transformer: crate::codecs::Transformer,
     conn: RedisConnection,
     data_type: super::DataType,
@@ -281,7 +281,7 @@ impl RedisSink {
         let batcher_settings = config.batch.validate()?.into_batcher_settings()?;
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build()?;
-        let encoder = Encoder::<()>::new(serializer);
+        let encoder = Encoder::new(serializer);
         let key = config.key.clone();
         let request = config.request;
 

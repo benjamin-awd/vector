@@ -29,7 +29,7 @@ pub(super) enum BuildError {
 
 pub struct KafkaSink {
     transformer: Transformer,
-    encoder: Encoder<()>,
+    encoder: Encoder,
     service: RateLimit<KafkaService>,
     topic: Template,
     key_field: Option<OwnedTargetPath>,
@@ -54,7 +54,7 @@ impl KafkaSink {
         let producer = create_producer(producer_config)?;
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build()?;
-        let encoder = Encoder::<()>::new(serializer);
+        let encoder = Encoder::new(serializer);
 
         Ok(KafkaSink {
             headers_key: config.headers_key.map(|key| key.0),

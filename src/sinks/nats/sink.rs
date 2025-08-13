@@ -19,7 +19,7 @@ pub(super) struct NatsEvent {
 pub(super) struct NatsSink {
     request: TowerRequestConfig<NatsTowerRequestConfigDefaults>,
     transformer: Transformer,
-    encoder: Encoder<()>,
+    encoder: Encoder,
     publisher: Arc<NatsPublisher>,
     subject: Template,
     headers: Option<NatsHeaderConfig>,
@@ -46,7 +46,7 @@ impl NatsSink {
         let publisher = Arc::new(config.publisher().await?);
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build().context(EncodingSnafu)?;
-        let encoder = Encoder::<()>::new(serializer);
+        let encoder = Encoder::new(serializer);
         let request = config.request;
         let subject = config.subject;
         let headers = config.jetstream.headers;

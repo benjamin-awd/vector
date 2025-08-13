@@ -58,7 +58,7 @@ pub struct Metadata {
 }
 
 pub struct DatadogEventsRequestBuilder {
-    encoder: (Transformer, Encoder<()>),
+    encoder: (Transformer, Encoder),
 }
 
 impl Default for DatadogEventsRequestBuilder {
@@ -76,7 +76,7 @@ impl DatadogEventsRequestBuilder {
 impl RequestBuilder<Event> for DatadogEventsRequestBuilder {
     type Metadata = Metadata;
     type Events = Event;
-    type Encoder = (Transformer, Encoder<()>);
+    type Encoder = (Transformer, Encoder);
     type Payload = Bytes;
     type Request = DatadogEventsRequest;
     type Error = io::Error;
@@ -115,7 +115,7 @@ impl RequestBuilder<Event> for DatadogEventsRequestBuilder {
     }
 }
 
-fn encoder() -> (Transformer, Encoder<()>) {
+fn encoder() -> (Transformer, Encoder) {
     // DataDog Event API allows only some fields, and refuses
     // to accept event if it contains any other field.
     let only_fields = Some(
@@ -142,6 +142,6 @@ fn encoder() -> (Transformer, Encoder<()>) {
     (
         Transformer::new(only_fields, None, timestamp_format)
             .expect("transformer configuration must be valid"),
-        Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
+        Encoder::new(JsonSerializerConfig::default().build().into()),
     )
 }

@@ -14,7 +14,7 @@ use super::{
 
 pub struct MqttSink {
     transformer: Transformer,
-    encoder: Encoder<()>,
+    encoder: Encoder,
     connector: MqttConnector,
     topic: Template,
     quality_of_service: MqttQoS,
@@ -31,7 +31,7 @@ impl MqttSink {
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build()?;
         let topic = config.topic.clone();
-        let encoder = Encoder::<()>::new(serializer);
+        let encoder = Encoder::new(serializer);
 
         Ok(Self {
             transformer,
