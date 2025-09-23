@@ -1,39 +1,36 @@
 //! Implementation of the `clickhouse` sink.
 
-use super::{config::Format, request_builder::ClickhouseRequestBuilder};
-use crate::sinks::{prelude::*, util::http::HttpRequest};
+use crate::sinks::prelude::*;
+use clickhouse::{Client, Row};
+use serde::Serialize;
+use futures::stream::BoxStream;
+
+
+// TODO: figure a way to automatically create Clickhouse schema
+#[derive(Debug, Clone, Row, Serialize)]
+struct MessageRow {
+    message: String,
+}
 
 pub struct ClickhouseSink<S> {
     batch_settings: BatcherSettings,
-    service: S,
+    client: Client,
     database: Template,
     table: Template,
-    format: Format,
-    request_builder: ClickhouseRequestBuilder,
 }
 
-impl<S> ClickhouseSink<S>
-where
-    S: Service<HttpRequest<PartitionKey>> + Send + 'static,
-    S::Future: Send + 'static,
-    S::Response: DriverResponse + Send + 'static,
-    S::Error: std::fmt::Debug + Into<crate::Error> + Send,
-{
-    pub const fn new(
+impl <S> ClickhouseSink<S> {
+    pub fn new(
         batch_settings: BatcherSettings,
-        service: S,
+        client: Client,
         database: Template,
         table: Template,
-        format: Format,
-        request_builder: ClickhouseRequestBuilder,
     ) -> Self {
         Self {
             batch_settings,
-            service,
+            client,
             database,
             table,
-            format,
-            request_builder,
         }
     }
 
@@ -42,37 +39,68 @@ where
 
         input
             .batched_partitioned(
-                KeyPartitioner::new(self.database, self.table, self.format),
+                KeyPartitioner::new(self.database, self.table),
                 || batch_settings.as_byte_size_config(),
             )
             .filter_map(|(key, batch)| async move { key.map(move |k| (k, batch)) })
-            .request_builder(
-                default_request_builder_concurrency_limit(),
-                self.request_builder,
-            )
-            .filter_map(|request| async {
-                match request {
-                    Err(error) => {
-                        emit!(SinkRequestBuildError { error });
-                        None
+            .for_each_concurrent(25, move |(key, batch)| {
+                let client = self.client.clone();
+
+                // The get_finalizers() doesn't exist, need another way to move forward
+                // let finalizers = events.get_finalizers();
+
+                async move {
+                    // Convert Vector events into our strongly-typed MessageRow struct
+                    let rows: Vec<MessageRow> = events
+                        .into_iter()
+                        .filter_map(|event| {
+                            let log = event.as_log();
+                            // This is a simple conversion; a real implementation
+                            // would have more robust error handling.
+                            Some(MessageRow {
+                                message: log.get_field("message").map(|v| v.to_string_lossy()).unwrap_or_default(),
+                            })
+                        })
+                        .collect();
+
+                    if rows.is_empty() {
+                        return;
                     }
-                    Ok(req) => Some(req),
+
+                    // Use the client to insert the rows
+                    let table_name = format!("`{}`.`{}`", key.database, key.table);
+                    let mut insert = match client.insert(&table_name) {
+                        Ok(i) => i,
+                        Err(error) => {
+                            emit!(SinkRequestBuildError {
+                                error,
+                                finalizers,
+                                ..Default::default()
+                            });
+                            return;
+                        }
+                    };
+
+                    match insert.write_all(&rows).await {
+                        Ok(_) => {
+                            if let Err(error) = insert.end().await {
+                                emit!(SinkRequestBuildError { error, finalizers, ..Default::default() });
+                            }
+                        }
+                        Err(error) => {
+                             emit!(SinkRequestBuildError { error, finalizers, ..Default::default() });
+                        }
+                    };
                 }
             })
-            .into_driver(self.service)
-            .run()
-            .await
+            .await;
+
+        Ok(())
     }
 }
 
 #[async_trait::async_trait]
-impl<S> StreamSink<Event> for ClickhouseSink<S>
-where
-    S: Service<HttpRequest<PartitionKey>> + Send + 'static,
-    S::Future: Send + 'static,
-    S::Response: DriverResponse + Send + 'static,
-    S::Error: std::fmt::Debug + Into<crate::Error> + Send,
-{
+impl<S> StreamSink<Event> for ClickhouseSink<S> {
     async fn run(
         self: Box<Self>,
         input: futures_util::stream::BoxStream<'_, Event>,
@@ -86,22 +114,19 @@ where
 pub struct PartitionKey {
     pub database: String,
     pub table: String,
-    pub format: Format,
 }
 
 /// KeyPartitioner that partitions events by (database, table) pair.
 struct KeyPartitioner {
     database: Template,
     table: Template,
-    format: Format,
 }
 
 impl KeyPartitioner {
-    const fn new(database: Template, table: Template, format: Format) -> Self {
+    const fn new(database: Template, table: Template) -> Self {
         Self {
             database,
             table,
-            format,
         }
     }
 
@@ -126,10 +151,6 @@ impl Partitioner for KeyPartitioner {
     fn partition(&self, item: &Self::Item) -> Self::Key {
         let database = Self::render(&self.database, item, "database_key")?;
         let table = Self::render(&self.table, item, "table_key")?;
-        Some(PartitionKey {
-            database,
-            table,
-            format: self.format,
-        })
+        Some(PartitionKey { database, table })
     }
 }

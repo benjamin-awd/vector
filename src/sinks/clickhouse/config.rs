@@ -8,16 +8,16 @@ use vector_lib::codecs::{JsonSerializerConfig, NewlineDelimitedEncoderConfig, en
 
 use super::{
     request_builder::ClickhouseRequestBuilder,
-    service::{ClickhouseRetryLogic, ClickhouseServiceRequestBuilder},
-    sink::{ClickhouseSink, PartitionKey},
+    sink::{ClickhouseSink},
 };
 use crate::{
     http::{Auth, HttpClient, MaybeAuth},
     sinks::{
         prelude::*,
-        util::{RealtimeSizeBasedDefaultBatchSettings, UriSerde, http::HttpService},
+        util::{RealtimeSizeBasedDefaultBatchSettings, UriSerde},
     },
 };
+use clickhouse::Client;
 
 /// Data format.
 ///
@@ -103,10 +103,6 @@ pub struct ClickhouseConfig {
     pub auth: Option<Auth>,
 
     #[configurable(derived)]
-    #[serde(default)]
-    pub request: TowerRequestConfig,
-
-    #[configurable(derived)]
     pub tls: Option<TlsConfig>,
 
     #[configurable(derived)]
@@ -184,36 +180,32 @@ impl SinkConfig for ClickhouseConfig {
 
         let auth = self.auth.choose_one(&self.endpoint.auth)?;
 
-        let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
-
-        let client = HttpClient::new(tls_settings, &cx.proxy)?;
-
-        let clickhouse_service_request_builder = ClickhouseServiceRequestBuilder {
-            auth: auth.clone(),
-            endpoint: endpoint.clone(),
-            skip_unknown_fields: self.skip_unknown_fields,
-            date_time_best_effort: self.date_time_best_effort,
-            insert_random_shard: self.insert_random_shard,
-            compression: self.compression,
-            query_settings: self.query_settings,
-        };
-
-        let service: HttpService<ClickhouseServiceRequestBuilder, PartitionKey> =
-            HttpService::new(client.clone(), clickhouse_service_request_builder);
-
-        let request_limits = self.request.into_settings();
-
-        let service = ServiceBuilder::new()
-            .settings(request_limits, ClickhouseRetryLogic::default())
-            .service(service);
-
-        let batch_settings = self.batch.into_batcher_settings()?;
-
         let database = self.database.clone().unwrap_or_else(|| {
             "default"
                 .try_into()
                 .expect("'default' should be a valid template")
         });
+
+        // Build the DSN (Data Source Name) for the clickhouse client
+        let user = "";
+        let password = "";
+
+        let dsn = format!(
+            "{}://{}{}@{}:{}/{}",
+            endpoint.scheme_str().unwrap_or("tcp"),
+            user.to_string(),
+            password.to_string(),
+            endpoint.host().unwrap_or("localhost"),
+            endpoint.port_u16().unwrap_or(9000),
+            database.get_ref() // Use the default database for the connection
+        );
+
+        let client = Client::default()
+            // .with_compression(self.compression.into())
+            // .with_timeout(Duration::from_secs(30))
+            .with_url(dsn);
+
+        let batch_settings = self.batch.into_batcher_settings()?;
 
         let request_builder = ClickhouseRequestBuilder {
             compression: self.compression,
@@ -228,10 +220,9 @@ impl SinkConfig for ClickhouseConfig {
 
         let sink = ClickhouseSink::new(
             batch_settings,
-            service,
+            client,
             database,
             self.table.clone(),
-            self.format,
             request_builder,
         );
 
