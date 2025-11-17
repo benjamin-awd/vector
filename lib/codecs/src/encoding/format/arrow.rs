@@ -8,14 +8,15 @@ use arrow::{
     array::{
         ArrayRef, BinaryBuilder, BooleanBuilder, Decimal128Builder, Decimal256Builder,
         Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder,
-        StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
-        TimestampNanosecondBuilder, TimestampSecondBuilder, UInt8Builder, UInt16Builder,
-        UInt32Builder, UInt64Builder,
+        ListBuilder, StringBuilder, StructBuilder, TimestampMicrosecondBuilder,
+        TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder,
+        UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
     },
-    datatypes::{DataType, Schema, TimeUnit, i256},
+    datatypes::{DataType, Field, Fields, Schema, TimeUnit, i256},
     ipc::writer::StreamWriter,
     record_batch::RecordBatch,
 };
+use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -25,11 +26,24 @@ use vector_config::configurable_component;
 
 use vector_core::event::{Event, Value};
 
+/// Provides Arrow schema for encoding.
+///
+/// Sinks can implement this trait to provide custom schema fetching logic,
+/// such as fetching from a database, inferring from data, or loading from configuration.
+#[async_trait]
+pub trait SchemaProvider: Send + Sync + std::fmt::Debug {
+    /// Get the Arrow schema for encoding events.
+    ///
+    /// This method will be called once before encoding begins, and the result
+    /// will be cached for the lifetime of the encoder.
+    async fn get_schema(&self) -> Result<Arc<Schema>, ArrowEncodingError>;
+}
+
 /// Configuration for Arrow IPC stream serialization
 #[configurable_component]
 #[derive(Clone, Default)]
 pub struct ArrowStreamSerializerConfig {
-    /// The Arrow schema to use for encoding
+    /// The Arrow schema to use for encoding (if known immediately)
     #[serde(skip)]
     #[configurable(derived)]
     pub schema: Option<Arc<arrow::datatypes::Schema>>,
@@ -45,6 +59,10 @@ pub struct ArrowStreamSerializerConfig {
     #[serde(default)]
     #[configurable(metadata(docs::examples = true))]
     pub allow_nullable_fields: bool,
+
+    /// Schema provider for lazy schema loading (not serializable)
+    #[serde(skip)]
+    schema_provider: Option<Arc<dyn SchemaProvider>>,
 }
 
 impl std::fmt::Debug for ArrowStreamSerializerConfig {
@@ -58,16 +76,52 @@ impl std::fmt::Debug for ArrowStreamSerializerConfig {
                     .map(|s| format!("{} fields", s.fields().len())),
             )
             .field("allow_nullable_fields", &self.allow_nullable_fields)
+            .field(
+                "schema_provider",
+                &self.schema_provider.as_ref().map(|_| "<provider>"),
+            )
             .finish()
     }
 }
 
 impl ArrowStreamSerializerConfig {
-    /// Create a new ArrowStreamSerializerConfig with a schema
+    /// Create a new ArrowStreamSerializerConfig with an immediate schema
     pub fn new(schema: Arc<arrow::datatypes::Schema>) -> Self {
         Self {
             schema: Some(schema),
             allow_nullable_fields: false,
+            schema_provider: None,
+        }
+    }
+
+    /// Create a new ArrowStreamSerializerConfig with a schema provider
+    pub fn with_provider(provider: Arc<dyn SchemaProvider>) -> Self {
+        Self {
+            schema: None,
+            schema_provider: Some(provider),
+            allow_nullable_fields: false,
+        }
+    }
+
+    /// Get the schema provider if one was configured
+    pub fn provider(&self) -> Option<&Arc<dyn SchemaProvider>> {
+        self.schema_provider.as_ref()
+    }
+
+    /// Resolve the schema from the provider if present.
+    pub async fn resolve(&mut self) -> Result<(), ArrowEncodingError> {
+        // If schema already exists, nothing to do
+        if self.schema.is_some() {
+            return Ok(());
+        }
+
+        // Fetch from provider if available
+        if let Some(provider) = &self.schema_provider {
+            let schema = provider.get_schema().await?;
+            self.schema = Some(schema);
+            Ok(())
+        } else {
+            Err(ArrowEncodingError::NoSchemaProvided)
         }
     }
 
@@ -110,7 +164,10 @@ impl ArrowStreamSerializer {
             ));
         }
 
-        Ok(Self { schema })
+        Ok(Self {
+            schema,
+            allow_nullable_fields: config.allow_nullable_fields,
+        })
     }
 }
 
@@ -153,6 +210,13 @@ pub enum ArrowEncodingError {
     /// Schema must be provided before encoding
     #[snafu(display("Schema must be provided before encoding"))]
     NoSchemaProvided,
+
+    /// Failed to fetch schema from provider
+    #[snafu(display("Failed to fetch schema from provider: {}", message))]
+    SchemaFetchError {
+        /// Error message from the provider
+        message: String,
+    },
 
     /// Unsupported Arrow data type for field
     #[snafu(display(
@@ -199,7 +263,7 @@ pub fn encode_events_to_arrow_ipc_stream(
 
     let schema_ref = schema.ok_or(ArrowEncodingError::NoSchemaProvided)?;
 
-    let record_batch = build_record_batch(schema_ref, events)?;
+    let record_batch = build_record_batch(schema_ref, events, allow_nullable_fields)?;
 
     let ipc_err = |source| ArrowEncodingError::IpcWrite { source };
 
@@ -215,7 +279,9 @@ pub fn encode_events_to_arrow_ipc_stream(
 /// Recursively makes a Field and all its nested fields nullable
 fn make_field_nullable(field: &arrow::datatypes::Field) -> arrow::datatypes::Field {
     let new_data_type = match field.data_type() {
-        DataType::List(inner_field) => DataType::List(Arc::new(make_field_nullable(inner_field))),
+        DataType::List(inner_field) => {
+            DataType::List(Arc::new(make_field_nullable(inner_field)))
+        }
         DataType::Struct(fields) => {
             DataType::Struct(fields.iter().map(|f| make_field_nullable(f)).collect())
         }
@@ -265,6 +331,10 @@ fn build_record_batch(
             DataType::Decimal256(precision, scale) => {
                 build_decimal256_array(events, field_name, *precision, *scale, nullable)?
             }
+            DataType::List(list_field) => {
+                build_list_array(events, field_name, Arc::clone(list_field), nullable)?
+            }
+            DataType::Struct(fields) => build_struct_array(events, field_name, fields.clone(), nullable)?,
             other_type => {
                 return Err(ArrowEncodingError::UnsupportedType {
                     field_name: field_name.into(),
@@ -619,6 +689,450 @@ fn build_decimal256_array(
 
             if !appended {
                 handle_null_constraints!(builder, nullable, field_name);
+            }
+        }
+    }
+
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Builds an Arrow List array from Vector events
+/// Handles Vector Value::Array -> Arrow ListArray conversion
+#[allow(unused_variables)]
+fn build_list_array(
+    events: &[Event],
+    field_name: &str,
+    field: Arc<Field>,
+    nullable: bool,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    let element_type = field.data_type();
+
+    // Create a ListBuilder with the appropriate value builder based on element type
+    match element_type {
+        DataType::Int32 => {
+            let values_builder = Int64Builder::new(); // Vector uses i64 for integers
+            let mut builder = ListBuilder::new(values_builder);
+
+            for event in events {
+                if let Event::Log(log) = event {
+                    if let Some(Value::Array(arr)) = log.get(field_name) {
+                        for value in arr {
+                            if let Value::Integer(i) = value {
+                                if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 {
+                                    builder.values().append_value(*i);
+                                } else {
+                                    builder.values().append_null();
+                                }
+                            } else {
+                                builder.values().append_null();
+                            }
+                        }
+                        builder.append(true);
+                    } else {
+                        builder.append(false); // Null list
+                    }
+                }
+            }
+
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Int64 => {
+            let values_builder = Int64Builder::new();
+            let mut builder = ListBuilder::new(values_builder);
+
+            for event in events {
+                if let Event::Log(log) = event {
+                    if let Some(Value::Array(arr)) = log.get(field_name) {
+                        for value in arr {
+                            if let Value::Integer(i) = value {
+                                builder.values().append_value(*i);
+                            } else {
+                                builder.values().append_null();
+                            }
+                        }
+                        builder.append(true);
+                    } else {
+                        builder.append(false);
+                    }
+                }
+            }
+
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Float32 | DataType::Float64 => {
+            let values_builder = Float64Builder::new();
+            let mut builder = ListBuilder::new(values_builder);
+
+            for event in events {
+                if let Event::Log(log) = event {
+                    if let Some(Value::Array(arr)) = log.get(field_name) {
+                        for value in arr {
+                            match value {
+                                Value::Float(f) => builder.values().append_value(f.into_inner()),
+                                Value::Integer(i) => builder.values().append_value(*i as f64),
+                                _ => builder.values().append_null(),
+                            }
+                        }
+                        builder.append(true);
+                    } else {
+                        builder.append(false);
+                    }
+                }
+            }
+
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Utf8 => {
+            let values_builder = StringBuilder::new();
+            let mut builder = ListBuilder::new(values_builder);
+
+            for event in events {
+                if let Event::Log(log) = event {
+                    if let Some(Value::Array(arr)) = log.get(field_name) {
+                        for value in arr {
+                            match value {
+                                Value::Bytes(bytes) => {
+                                    if let Ok(s) = std::str::from_utf8(bytes) {
+                                        builder.values().append_value(s);
+                                    } else {
+                                        builder.values().append_value(&String::from_utf8_lossy(bytes));
+                                    }
+                                }
+                                _ => builder.values().append_value(&value.to_string_lossy()),
+                            }
+                        }
+                        builder.append(true);
+                    } else {
+                        builder.append(false);
+                    }
+                }
+            }
+
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Boolean => {
+            let values_builder = BooleanBuilder::new();
+            let mut builder = ListBuilder::new(values_builder);
+
+            for event in events {
+                if let Event::Log(log) = event {
+                    if let Some(Value::Array(arr)) = log.get(field_name) {
+                        for value in arr {
+                            if let Value::Boolean(b) = value {
+                                builder.values().append_value(*b);
+                            } else {
+                                builder.values().append_null();
+                            }
+                        }
+                        builder.append(true);
+                    } else {
+                        builder.append(false);
+                    }
+                }
+            }
+
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::List(_nested_field) => {
+            // Nested arrays not yet supported
+            Err(ArrowEncodingError::UnsupportedType {
+                field_name: format!("{}[nested array]", field_name),
+                data_type: element_type.clone(),
+            })
+        }
+        DataType::Struct(fields) => {
+            // Array of structs (tuples)
+            return build_array_of_structs(events, field_name, fields, nullable);
+        }
+        _ => Err(ArrowEncodingError::UnsupportedType {
+            field_name: format!("{}[element]", field_name),
+            data_type: element_type.clone(),
+        }),
+    }
+}
+
+/// Helper function to build an array of struct arrays
+#[allow(unused_variables)]
+fn build_array_of_structs(
+    events: &[Event],
+    field_name: &str,
+    fields: &Fields,
+    nullable: bool,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    // For arrays of objects/tuples, we need to build each field's values across all array elements
+    let field_builders: Vec<Box<dyn arrow::array::ArrayBuilder>> = fields
+        .iter()
+        .map(|field| -> Box<dyn arrow::array::ArrayBuilder> {
+            match field.data_type() {
+                DataType::Utf8 => Box::new(StringBuilder::new()),
+                DataType::Int8 => Box::new(Int8Builder::new()),
+                DataType::Int16 => Box::new(Int16Builder::new()),
+                DataType::Int32 => Box::new(Int32Builder::new()),
+                DataType::Int64 => Box::new(Int64Builder::new()),
+                DataType::Float32 => Box::new(Float32Builder::new()),
+                DataType::Float64 => Box::new(Float64Builder::new()),
+                DataType::Boolean => Box::new(BooleanBuilder::new()),
+                _ => Box::new(StringBuilder::new()), // Default to string
+            }
+        })
+        .collect();
+
+    let struct_builder = StructBuilder::new(fields.clone(), field_builders);
+    let mut list_builder = ListBuilder::new(struct_builder);
+
+    for event in events {
+        if let Event::Log(log) = event {
+            if let Some(Value::Array(arr)) = log.get(field_name) {
+                // For each object in the array
+                for value in arr {
+                    if let Value::Object(obj) = value {
+                        // Append each field from the object
+                        for (idx, field) in fields.iter().enumerate() {
+                            let field_value = obj.get(field.name().as_str());
+                            append_struct_field_value(
+                                list_builder.values(),
+                                idx,
+                                field_value,
+                                field.data_type(),
+                            );
+                        }
+                        list_builder.values().append(true);
+                    } else {
+                        // Not an object - append nulls for all fields
+                        for idx in 0..fields.len() {
+                            append_struct_field_null(list_builder.values(), idx, &fields[idx]);
+                        }
+                        list_builder.values().append(false);
+                    }
+                }
+                list_builder.append(true);
+            } else {
+                list_builder.append(false);
+            }
+        }
+    }
+
+    Ok(Arc::new(list_builder.finish()))
+}
+
+/// Helper to append a value to a struct field
+fn append_struct_field_value(
+    struct_builder: &mut StructBuilder,
+    field_idx: usize,
+    value: Option<&Value>,
+    data_type: &DataType,
+) {
+    match data_type {
+        DataType::Utf8 => {
+            let str_builder = struct_builder
+                .field_builder::<StringBuilder>(field_idx)
+                .unwrap();
+            if let Some(v) = value {
+                match v {
+                    Value::Bytes(bytes) => {
+                        if let Ok(s) = std::str::from_utf8(bytes) {
+                            str_builder.append_value(s);
+                        } else {
+                            str_builder.append_value(&String::from_utf8_lossy(bytes));
+                        }
+                    }
+                    _ => str_builder.append_value(&v.to_string_lossy()),
+                }
+            } else {
+                str_builder.append_null();
+            }
+        }
+        DataType::Int8 => {
+            let int_builder = struct_builder
+                .field_builder::<Int8Builder>(field_idx)
+                .unwrap();
+            match value {
+                Some(Value::Integer(i)) if *i >= i8::MIN as i64 && *i <= i8::MAX as i64 => {
+                    int_builder.append_value(*i as i8);
+                }
+                _ => int_builder.append_null(),
+            }
+        }
+        DataType::Int16 => {
+            let int_builder = struct_builder
+                .field_builder::<Int16Builder>(field_idx)
+                .unwrap();
+            match value {
+                Some(Value::Integer(i)) if *i >= i16::MIN as i64 && *i <= i16::MAX as i64 => {
+                    int_builder.append_value(*i as i16);
+                }
+                _ => int_builder.append_null(),
+            }
+        }
+        DataType::Int32 => {
+            let int_builder = struct_builder
+                .field_builder::<Int32Builder>(field_idx)
+                .unwrap();
+            match value {
+                Some(Value::Integer(i)) if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 => {
+                    int_builder.append_value(*i as i32);
+                }
+                _ => int_builder.append_null(),
+            }
+        }
+        DataType::Int64 => {
+            let int_builder = struct_builder
+                .field_builder::<Int64Builder>(field_idx)
+                .unwrap();
+            if let Some(Value::Integer(i)) = value {
+                int_builder.append_value(*i);
+            } else {
+                int_builder.append_null();
+            }
+        }
+        DataType::Float32 => {
+            let float_builder = struct_builder
+                .field_builder::<Float32Builder>(field_idx)
+                .unwrap();
+            match value {
+                Some(Value::Float(f)) => float_builder.append_value(f.into_inner() as f32),
+                Some(Value::Integer(i)) => float_builder.append_value(*i as f32),
+                _ => float_builder.append_null(),
+            }
+        }
+        DataType::Float64 => {
+            let float_builder = struct_builder
+                .field_builder::<Float64Builder>(field_idx)
+                .unwrap();
+            match value {
+                Some(Value::Float(f)) => float_builder.append_value(f.into_inner()),
+                Some(Value::Integer(i)) => float_builder.append_value(*i as f64),
+                _ => float_builder.append_null(),
+            }
+        }
+        DataType::Boolean => {
+            let bool_builder = struct_builder
+                .field_builder::<BooleanBuilder>(field_idx)
+                .unwrap();
+            if let Some(Value::Boolean(b)) = value {
+                bool_builder.append_value(*b);
+            } else {
+                bool_builder.append_null();
+            }
+        }
+        _ => {
+            // Default: try to serialize as string
+            let str_builder = struct_builder
+                .field_builder::<StringBuilder>(field_idx)
+                .unwrap();
+            if let Some(v) = value {
+                str_builder.append_value(&v.to_string_lossy());
+            } else {
+                str_builder.append_null();
+            }
+        }
+    }
+}
+
+/// Helper to append a null to a struct field
+fn append_struct_field_null(struct_builder: &mut StructBuilder, field_idx: usize, field: &Field) {
+    match field.data_type() {
+        DataType::Utf8 => {
+            struct_builder
+                .field_builder::<StringBuilder>(field_idx)
+                .unwrap()
+                .append_null();
+        }
+        DataType::Int8 => {
+            struct_builder
+                .field_builder::<Int8Builder>(field_idx)
+                .unwrap()
+                .append_null();
+        }
+        DataType::Int16 => {
+            struct_builder
+                .field_builder::<Int16Builder>(field_idx)
+                .unwrap()
+                .append_null();
+        }
+        DataType::Int32 => {
+            struct_builder
+                .field_builder::<Int32Builder>(field_idx)
+                .unwrap()
+                .append_null();
+        }
+        DataType::Int64 => {
+            struct_builder
+                .field_builder::<Int64Builder>(field_idx)
+                .unwrap()
+                .append_null();
+        }
+        DataType::Float32 => {
+            struct_builder
+                .field_builder::<Float32Builder>(field_idx)
+                .unwrap()
+                .append_null();
+        }
+        DataType::Float64 => {
+            struct_builder
+                .field_builder::<Float64Builder>(field_idx)
+                .unwrap()
+                .append_null();
+        }
+        DataType::Boolean => {
+            struct_builder
+                .field_builder::<BooleanBuilder>(field_idx)
+                .unwrap()
+                .append_null();
+        }
+        _ => {
+            struct_builder
+                .field_builder::<StringBuilder>(field_idx)
+                .unwrap()
+                .append_null();
+        }
+    }
+}
+
+/// Builds an Arrow Struct array from Vector events
+/// Handles Vector Value::Object -> Arrow StructArray conversion
+#[allow(unused_variables)]
+fn build_struct_array(
+    events: &[Event],
+    field_name: &str,
+    fields: Fields,
+    nullable: bool,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    // Create field builders for each struct field
+    let field_builders: Vec<Box<dyn arrow::array::ArrayBuilder>> = fields
+        .iter()
+        .map(|field| -> Box<dyn arrow::array::ArrayBuilder> {
+            match field.data_type() {
+                DataType::Utf8 => Box::new(StringBuilder::new()),
+                DataType::Int8 => Box::new(Int8Builder::new()),
+                DataType::Int16 => Box::new(Int16Builder::new()),
+                DataType::Int32 => Box::new(Int32Builder::new()),
+                DataType::Int64 => Box::new(Int64Builder::new()),
+                DataType::Float32 => Box::new(Float32Builder::new()),
+                DataType::Float64 => Box::new(Float64Builder::new()),
+                DataType::Boolean => Box::new(BooleanBuilder::new()),
+                _ => Box::new(StringBuilder::new()), // Default to string for unsupported types
+            }
+        })
+        .collect();
+
+    let mut builder = StructBuilder::new(fields.clone(), field_builders);
+
+    for event in events {
+        if let Event::Log(log) = event {
+            if let Some(Value::Object(obj)) = log.get(field_name) {
+                // Append each field value
+                for (idx, field) in fields.iter().enumerate() {
+                    let value = obj.get(field.name().as_str());
+                    append_struct_field_value(&mut builder, idx, value, field.data_type());
+                }
+                builder.append(true);
+            } else {
+                // Not an object or missing - append null struct
+                for (idx, field) in fields.iter().enumerate() {
+                    append_struct_field_null(&mut builder, idx, field);
+                }
+                builder.append(false);
             }
         }
     }
@@ -1535,6 +2049,169 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
+
+        assert_eq!(array.value(0), 42);
+        assert!(!array.is_null(0));
+        assert!(
+            array.is_null(1),
+            "The missing value should be encoded as null"
+        );
+    }
+
+    #[test]
+    fn test_make_field_nullable_with_nested_types() {
+        // Test that make_field_nullable recursively handles List and Struct types
+
+        // Create a nested structure: Struct containing a List of Structs
+        // struct { inner_list: [{ nested_field: Int64 }] }
+        let inner_struct_field = Field::new("nested_field", DataType::Int64, false);
+        let inner_struct =
+            DataType::Struct(arrow::datatypes::Fields::from(vec![inner_struct_field]));
+        let list_field = Field::new("item", inner_struct, false);
+        let list_type = DataType::List(Arc::new(list_field));
+        let outer_field = Field::new("inner_list", list_type, false);
+        let outer_struct = DataType::Struct(arrow::datatypes::Fields::from(vec![outer_field]));
+
+        let original_field = Field::new("root", outer_struct, false);
+
+        // Apply make_field_nullable
+        let nullable_field = make_field_nullable(&original_field);
+
+        // Verify root field is nullable
+        assert!(
+            nullable_field.is_nullable(),
+            "Root field should be nullable"
+        );
+
+        // Verify nested struct is nullable
+        if let DataType::Struct(root_fields) = nullable_field.data_type() {
+            let inner_list_field = &root_fields[0];
+            assert!(
+                inner_list_field.is_nullable(),
+                "inner_list field should be nullable"
+            );
+
+            // Verify list element is nullable
+            if let DataType::List(list_item_field) = inner_list_field.data_type() {
+                assert!(
+                    list_item_field.is_nullable(),
+                    "List item field should be nullable"
+                );
+
+                // Verify inner struct fields are nullable
+                if let DataType::Struct(inner_struct_fields) = list_item_field.data_type() {
+                    let nested_field = &inner_struct_fields[0];
+                    assert!(
+                        nested_field.is_nullable(),
+                        "nested_field should be nullable"
+                    );
+                } else {
+                    panic!("Expected Struct type for list items");
+                }
+            } else {
+                panic!("Expected List type for inner_list");
+            }
+        } else {
+            panic!("Expected Struct type for root field");
+        }
+    }
+
+    #[test]
+    fn test_make_field_nullable_with_map_type() {
+        // Test that make_field_nullable handles Map types
+        // Map is internally represented as List<Struct<key, value>>
+
+        // Create a map: Map<Utf8, Int64>
+        // Internally: List<Struct<entries: {key: Utf8, value: Int64}>>
+        let key_field = Field::new("key", DataType::Utf8, false);
+        let value_field = Field::new("value", DataType::Int64, false);
+        let entries_struct =
+            DataType::Struct(arrow::datatypes::Fields::from(vec![key_field, value_field]));
+        let entries_field = Field::new("entries", entries_struct, false);
+        let map_type = DataType::Map(Arc::new(entries_field), false);
+
+        let original_field = Field::new("my_map", map_type, false);
+
+        // Apply make_field_nullable
+        let nullable_field = make_field_nullable(&original_field);
+
+        // Verify root field is nullable
+        assert!(
+            nullable_field.is_nullable(),
+            "Root map field should be nullable"
+        );
+
+        // Verify map entries are nullable
+        if let DataType::Map(entries_field, _sorted) = nullable_field.data_type() {
+            assert!(
+                entries_field.is_nullable(),
+                "Map entries field should be nullable"
+            );
+
+            // Verify the struct inside the map is nullable
+            if let DataType::Struct(struct_fields) = entries_field.data_type() {
+                let key_field = &struct_fields[0];
+                let value_field = &struct_fields[1];
+                assert!(key_field.is_nullable(), "Map key field should be nullable");
+                assert!(
+                    value_field.is_nullable(),
+                    "Map value field should be nullable"
+                );
+            } else {
+                panic!("Expected Struct type for map entries");
+            }
+        } else {
+            panic!("Expected Map type for my_map field");
+        }
+    }
+
+    #[test]
+    fn test_allow_nullable_fields_enabled() {
+        // Test that allow_nullable_fields=true allows nulls for non-nullable fields
+        let mut log1 = LogEvent::default();
+        log1.insert("strict_field", 42);
+        let log2 = LogEvent::default();
+        let events = vec![Event::Log(log1), Event::Log(log2)];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "strict_field",
+            DataType::Int64,
+            false,
+        )]));
+
+        let mut config = ArrowStreamSerializerConfig::new(Arc::clone(&schema));
+        config.allow_nullable_fields = true;
+
+        let mut serializer =
+            ArrowStreamSerializer::new(config).expect("Failed to create serializer");
+
+        let mut buffer = BytesMut::new();
+        serializer
+            .encode(events, &mut buffer)
+            .expect("Encoding should succeed when allow_nullable_fields is true");
+
+        let cursor = Cursor::new(buffer);
+        let mut reader = StreamReader::try_new(cursor, None).expect("Failed to create reader");
+        let batch = reader.next().unwrap().expect("Failed to read batch");
+
+        assert_eq!(batch.num_rows(), 2);
+
+        let binding = batch.schema();
+        let output_field = binding.field(0);
+        assert!(
+            output_field.is_nullable(),
+            "The output schema field should have been transformed to nullable=true"
+        );
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        assert_eq!(id_array.value(0), 1);
+        assert_eq!(id_array.value(1), 2);
+        assert!(id_array.is_null(2)); // Missing value encoded as null
 
         assert_eq!(array.value(0), 42);
         assert!(!array.is_null(0));
