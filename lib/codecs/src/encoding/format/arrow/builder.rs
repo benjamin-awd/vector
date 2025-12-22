@@ -391,7 +391,7 @@ fn build_array_for_field(events: &[Event], field: &Field) -> Result<ArrayRef, Ar
 }
 
 /// Builds an Arrow RecordBatch from events
-pub(crate) fn build_record_batch(
+pub fn build_record_batch(
     schema: SchemaRef,
     events: &[Event],
 ) -> Result<RecordBatch, ArrowEncodingError> {

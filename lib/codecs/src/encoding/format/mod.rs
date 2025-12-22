@@ -24,7 +24,8 @@ use std::fmt::Debug;
 
 #[cfg(feature = "arrow")]
 pub use arrow::{
-    ArrowEncodingError, ArrowStreamSerializer, ArrowStreamSerializerConfig, SchemaProvider,
+    build_record_batch, ArrowEncodingError, ArrowStreamSerializer, ArrowStreamSerializerConfig,
+    SchemaProvider,
 };
 pub use avro::{AvroSerializer, AvroSerializerConfig, AvroSerializerOptions};
 pub use cef::{CefSerializer, CefSerializerConfig};

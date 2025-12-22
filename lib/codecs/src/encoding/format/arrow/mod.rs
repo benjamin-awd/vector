@@ -20,7 +20,7 @@ use snafu::Snafu;
 use std::sync::Arc;
 use vector_config::configurable_component;
 
-use builder::build_record_batch;
+pub use builder::build_record_batch;
 
 /// Provides Arrow schema for encoding.
 ///
@@ -122,6 +122,11 @@ impl ArrowStreamSerializer {
         Ok(Self {
             schema: SchemaRef::new(schema),
         })
+    }
+
+    /// Get a reference to the Arrow schema used by this serializer
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
     }
 }
 

@@ -297,6 +297,9 @@ azure_core_for_storage = { package = "azure_core", version = "0.21.0", default-f
 # OpenDAL
 opendal = { version = "0.54", default-features = false, features = ["services-webhdfs"], optional = true }
 
+# Delta Lake - using 0.29.4 for compatibility
+deltalake = { version = "0.29.4", default-features = false, features = ["gcs", "rustls"], optional = true }
+
 # Tower
 tower = { version = "0.5.2", default-features = false, features = ["buffer", "limit", "retry", "timeout", "util", "balance", "discover"] }
 tower-http = { version = "0.4.4", default-features = false, features = ["compression-full", "decompression-gzip", "trace"] }
@@ -342,6 +345,7 @@ async-compression = { version = "0.4.27", default-features = false, features = [
 apache-avro = { version = "0.16.0", default-features = false, optional = true }
 arrow = { version = "56.2.0", default-features = false, features = ["ipc"], optional = true }
 arrow-schema = { version = "56.2.0", default-features = false, optional = true }
+parquet = { version = "56.2.0", default-features = false, features = ["arrow"], optional = true }
 axum = { version = "0.6.20", default-features = false }
 base64 = { workspace = true, optional = true }
 bloomy = { version = "1.2.0", default-features = false, optional = true }
@@ -789,6 +793,7 @@ sinks-logs = [
   "sinks-clickhouse",
   "sinks-console",
   "sinks-databend",
+  "sinks-delta_lake",
   "sinks-datadog_events",
   "sinks-datadog_logs",
   "sinks-datadog_traces",
@@ -855,6 +860,7 @@ sinks-chronicle = []
 sinks-clickhouse = ["dep:rust_decimal", "codecs-arrow"]
 sinks-console = []
 sinks-databend = ["dep:databend-client"]
+sinks-delta_lake = ["dep:deltalake", "codecs-arrow", "dep:opendal", "dep:parquet"]
 sinks-datadog_events = []
 sinks-datadog_logs = []
 sinks-datadog_metrics = ["protobuf-build", "dep:prost", "dep:prost-reflect"]
