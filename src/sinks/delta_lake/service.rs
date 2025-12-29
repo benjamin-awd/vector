@@ -3,7 +3,7 @@
 //! This module implements the service layer that handles actual writes to Delta Lake,
 //! including Parquet file creation and transaction log management.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
 use deltalake::writer::{DeltaWriter, RecordBatchWriter};
@@ -49,16 +49,19 @@ impl DriverResponse for DeltaLakeResponse {
 /// This service handles the conversion of Parquet bytes back to RecordBatch,
 /// then uses Delta Lake's RecordBatchWriter to create Parquet files and
 /// transaction log entries.
+///
+/// The table is wrapped in RwLock to allow updating the cached snapshot after
+/// successful commits, reducing unnecessary conflict retries.
 #[derive(Clone)]
 pub struct DeltaLakeService {
-    table: Arc<DeltaTable>,
+    table: Arc<RwLock<DeltaTable>>,
 }
 
 impl DeltaLakeService {
     /// Create a new Delta Lake service for the given table.
     pub fn new(table: DeltaTable) -> Self {
         Self {
-            table: Arc::new(table),
+            table: Arc::new(RwLock::new(table)),
         }
     }
 }
@@ -74,9 +77,16 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
     }
 
     fn call(&mut self, request: DeltaLakeRequest) -> Self::Future {
-        let mut table = (*self.table).clone();
+        let table_lock = Arc::clone(&self.table);
 
         Box::pin(async move {
+            // Get a clone of the current table snapshot
+            let mut table = {
+                let table_guard = table_lock.read().map_err(|e| {
+                    DeltaTableError::Generic(format!("Failed to acquire table read lock: {}", e))
+                })?;
+                table_guard.clone()
+            };
             // Retry loop for handling concurrent transaction conflicts
             // When optimization operations (like z-order) rewrite files, we need to
             // reload the table snapshot and retry the write
@@ -110,7 +120,19 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                 // Returns the number of rows written
                 match writer.flush_and_commit(&mut table).await {
                     Ok(_rows_written) => {
-                        // Success! Get the actual bytes written from the table metadata
+                        // Success! Update the cached table to the latest version
+                        // This prevents future requests from starting with stale snapshots
+                        {
+                            let mut table_guard = table_lock.write().map_err(|e| {
+                                DeltaTableError::Generic(format!(
+                                    "Failed to acquire table write lock: {}",
+                                    e
+                                ))
+                            })?;
+                            *table_guard = table.clone();
+                        }
+
+                        // Get the actual bytes written from the table metadata
                         // For now, estimate based on parquet data size
                         let bytes_written = request.parquet_data.len();
 
