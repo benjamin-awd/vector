@@ -77,42 +77,93 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
         let mut table = (*self.table).clone();
 
         Box::pin(async move {
-            // Deserialize Parquet bytes back to RecordBatch
-            // Use Bytes directly as it implements ChunkReader
-            let bytes = request.parquet_data.clone();
-            let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|e| {
-                DeltaTableError::Generic(format!("Failed to create Parquet reader: {}", e))
-            })?;
+            // Retry loop for handling concurrent transaction conflicts
+            // When optimization operations (like z-order) rewrite files, we need to
+            // reload the table snapshot and retry the write
+            const MAX_CONFLICT_RETRIES: usize = 3;
+            let mut retry_count = 0;
 
-            let mut reader = builder.build().map_err(|e| {
-                DeltaTableError::Generic(format!("Failed to build Parquet reader: {}", e))
-            })?;
+            loop {
+                // Deserialize Parquet bytes back to RecordBatch
+                // Use Bytes directly as it implements ChunkReader
+                let bytes = request.parquet_data.clone();
+                let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|e| {
+                    DeltaTableError::Generic(format!("Failed to create Parquet reader: {}", e))
+                })?;
 
-            // Create Delta writer
-            let mut writer = RecordBatchWriter::for_table(&table)?;
+                let mut reader = builder.build().map_err(|e| {
+                    DeltaTableError::Generic(format!("Failed to build Parquet reader: {}", e))
+                })?;
 
-            // Write all batches (usually just one)
-            while let Some(batch_result) = reader.next() {
-                let batch = batch_result
-                    .map_err(|e| DeltaTableError::Generic(format!("Failed to read batch: {}", e)))?;
-                writer.write(batch).await?;
+                // Create Delta writer
+                let mut writer = RecordBatchWriter::for_table(&table)?;
+
+                // Write all batches (usually just one)
+                while let Some(batch_result) = reader.next() {
+                    let batch = batch_result.map_err(|e| {
+                        DeltaTableError::Generic(format!("Failed to read batch: {}", e))
+                    })?;
+                    writer.write(batch).await?;
+                }
+
+                // Flush and commit (writes Parquet to storage + creates transaction log)
+                // Returns the number of rows written
+                match writer.flush_and_commit(&mut table).await {
+                    Ok(_rows_written) => {
+                        // Success! Get the actual bytes written from the table metadata
+                        // For now, estimate based on parquet data size
+                        let bytes_written = request.parquet_data.len();
+
+                        return Ok(DeltaLakeResponse {
+                            events_byte_size: request
+                                .request_metadata
+                                .into_events_estimated_json_encoded_byte_size(),
+                            files_written: 1, // One commit creates one file typically
+                            bytes_written,
+                        });
+                    }
+                    Err(e) => {
+                        // Check if this is a concurrent delete/read conflict
+                        // This happens when optimization operations rewrite files
+                        let is_concurrent_conflict = matches!(
+                            &e,
+                            DeltaTableError::Transaction { source }
+                                if source.to_string().contains("ConcurrentDeleteRead")
+                                    || source.to_string().contains("concurrent transaction deleted")
+                        );
+
+                        if is_concurrent_conflict && retry_count < MAX_CONFLICT_RETRIES {
+                            retry_count += 1;
+                            warn!(
+                                message = "Concurrent table modification detected, reloading and retrying",
+                                retry_count = retry_count,
+                                max_retries = MAX_CONFLICT_RETRIES,
+                            );
+
+                            // Reload the table to get the latest snapshot
+                            // This picks up changes from optimize/vacuum operations
+                            table.load().await.map_err(|load_err| {
+                                DeltaTableError::Generic(format!(
+                                    "Failed to reload table after conflict: {}",
+                                    load_err
+                                ))
+                            })?;
+
+                            // Continue to retry with fresh snapshot
+                            continue;
+                        } else {
+                            // Not a concurrent conflict, or exhausted retries
+                            if is_concurrent_conflict {
+                                error!(
+                                    message = "Exhausted retries for concurrent conflict",
+                                    retry_count = retry_count,
+                                );
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
             }
-
-            // Flush and commit (writes Parquet to storage + creates transaction log)
-            // Returns the number of rows written
-            let _rows_written = writer.flush_and_commit(&mut table).await?;
-
-            // Get the actual bytes written from the table metadata
-            // For now, estimate based on parquet data size
-            let bytes_written = request.parquet_data.len();
-
-            Ok(DeltaLakeResponse {
-                events_byte_size: request
-                    .request_metadata
-                    .into_events_estimated_json_encoded_byte_size(),
-                files_written: 1, // One commit creates one file typically
-                bytes_written,
-            })
         })
     }
 }
