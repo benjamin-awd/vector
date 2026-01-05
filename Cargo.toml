@@ -297,8 +297,8 @@ azure_core_for_storage = { package = "azure_core", version = "0.21.0", default-f
 # OpenDAL
 opendal = { version = "0.54", default-features = false, features = ["services-webhdfs"], optional = true }
 
-# Delta Lake - using 0.29.4 for compatibility
-deltalake = { version = "0.29.4", default-features = false, features = ["gcs", "s3", "rustls"], optional = true }
+# Delta Lake
+deltalake = { version = "0.30.0", default-features = false, features = ["datafusion", "gcs", "s3", "rustls"], optional = true }
 
 # Tower
 tower = { version = "0.5.2", default-features = false, features = ["buffer", "limit", "retry", "timeout", "util", "balance", "discover"] }

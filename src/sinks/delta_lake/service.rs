@@ -190,7 +190,7 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                         emit!(EndpointBytesSent {
                             byte_size: bytes_written,
                             protocol: "delta_lake",
-                            endpoint: &table.table_uri(),
+                            endpoint: table.table_url().as_str(),
                         });
 
                         return Ok(DeltaLakeResponse {

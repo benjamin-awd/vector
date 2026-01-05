@@ -3,7 +3,7 @@
 //! This module implements the `SchemaProvider` trait to fetch Arrow schemas
 //! from existing Delta Lake tables at sink startup.
 
-use arrow::datatypes::Schema;
+use deltalake::arrow::datatypes::Schema;
 use async_trait::async_trait;
 use deltalake::kernel::engine::arrow_conversion::TryIntoArrow;
 use deltalake::DeltaTable;
