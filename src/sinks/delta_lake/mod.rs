@@ -10,4 +10,7 @@ pub mod schema;
 pub mod service;
 pub mod sink;
 
+#[cfg(all(test, feature = "delta-lake-integration-tests"))]
+mod integration_tests;
+
 pub use config::DeltaLakeConfig;

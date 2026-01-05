@@ -60,6 +60,19 @@ pub struct DeltaLakeConfig {
     #[serde(default)]
     pub batch_encoding: ArrowStreamSerializerConfig,
 
+    /// Enable automatic schema evolution.
+    ///
+    /// When enabled, the sink will automatically handle schema changes in the Delta Lake table:
+    /// - Reload the table schema when write failures indicate schema mismatches
+    /// - Retry writes with updated schema information
+    /// - Allow Delta Lake to merge compatible schema changes (new nullable columns)
+    ///
+    /// This is useful when multiple writers may be updating the table schema, or when
+    /// the table schema evolves over time. Disable this if you want strict schema enforcement.
+    #[configurable(metadata(docs::examples = true))]
+    #[serde(default = "default_schema_evolution")]
+    pub enable_schema_evolution: bool,
+
     /// Batching behavior configuration.
     ///
     /// For optimal Delta Lake performance, larger batch sizes (50-100MB) are recommended.
@@ -82,6 +95,10 @@ pub struct DeltaLakeConfig {
     pub acknowledgements: AcknowledgementsConfig,
 }
 
+fn default_schema_evolution() -> bool {
+    true
+}
+
 impl GenerateConfig for DeltaLakeConfig {
     fn generate_config() -> toml::Value {
         toml::Value::try_from(Self {
@@ -89,6 +106,7 @@ impl GenerateConfig for DeltaLakeConfig {
             table_path: "analytics/events".to_string(),
             credentials_path: Some("/path/to/service-account.json".to_string()),
             batch_encoding: ArrowStreamSerializerConfig::default(),
+            enable_schema_evolution: default_schema_evolution(),
             batch: BatchConfig::default(),
             request: TowerRequestConfig::default(),
             acknowledgements: AcknowledgementsConfig::default(),
@@ -141,7 +159,7 @@ impl SinkConfig for DeltaLakeConfig {
         };
 
         // 6. Build service with retries
-        let service = DeltaLakeService::new(table.clone());
+        let service = DeltaLakeService::new(table.clone(), self.enable_schema_evolution);
         let service = ServiceBuilder::new()
             .settings(self.request.into_settings(), DeltaLakeRetryLogic::default())
             .service(service);

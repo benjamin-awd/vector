@@ -341,11 +341,14 @@ greptimedb-ingester = { git = "https://github.com/GreptimeTeam/greptimedb-ingest
 
 # External libs
 arc-swap = { version = "1.7", default-features = false, optional = true }
-async-compression = { version = "0.4.27", default-features = false, features = ["tokio", "gzip", "zstd"], optional = true }
+# Pinned to 0.4.19 to use xz2 instead of liblzma (avoids conflict with datafusion's xz2)
+# See: https://github.com/apache/datafusion/issues/15342
+async-compression = { version = "=0.4.19", default-features = false, features = ["tokio", "gzip", "zstd"], optional = true }
 apache-avro = { version = "0.16.0", default-features = false, optional = true }
-arrow = { version = "56.2.0", default-features = false, features = ["ipc"], optional = true }
-arrow-schema = { version = "56.2.0", default-features = false, optional = true }
-parquet = { version = "56.2.0", default-features = false, features = ["arrow"], optional = true }
+# Updated to 57.1.0 for compatibility with deltalake 0.30.0
+arrow = { version = "57.1.0", default-features = false, features = ["ipc"], optional = true }
+arrow-schema = { version = "57.1.0", default-features = false, optional = true }
+parquet = { version = "57.1.0", default-features = false, features = ["arrow"], optional = true }
 axum = { version = "0.6.20", default-features = false }
 base64 = { workspace = true, optional = true }
 bloomy = { version = "1.2.0", default-features = false, optional = true }
@@ -497,7 +500,6 @@ nix = { git = "https://github.com/vectordotdev/nix.git", branch = "memfd/gnu/mus
 # The `heim` crates depend on `ntapi` 0.3.7 on Windows, but that version has an
 # unaligned access bug fixed in the following revision.
 ntapi = { git = "https://github.com/MSxDOS/ntapi.git", rev = "24fc1e47677fc9f6e38e5f154e6011dc9b270da6" }
-
 [features]
 # Default features for *-unknown-linux-gnu and *-apple-darwin
 default = ["api", "api-client", "enrichment-tables", "sinks", "sources", "sources-dnstap", "transforms", "unix", "rdkafka?/gssapi-vendored", "secrets"]
