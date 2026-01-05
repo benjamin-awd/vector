@@ -28,30 +28,36 @@ use super::sink::DeltaLakeSink;
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct DeltaLakeConfig {
-    /// GCS bucket containing the Delta Lake table.
+    /// Full URI to the Delta Lake table.
     ///
-    /// This is the name of the Google Cloud Storage bucket where the Delta Lake
-    /// table is stored. Do not include the `gs://` prefix.
-    #[configurable(metadata(docs::examples = "my-data-bucket"))]
-    #[configurable(metadata(docs::examples = "analytics-prod"))]
-    pub bucket: String,
-
-    /// Path to the Delta table within the bucket.
+    /// Supports multiple storage backends:
+    /// - Google Cloud Storage: `gs://bucket/path/to/table`
+    /// - Amazon S3: `s3://bucket/path/to/table`
+    /// - S3-compatible (MinIO, etc.): `s3://bucket/path/to/table` with custom endpoint
     ///
-    /// This path should point to an existing Delta Lake table directory.
     /// The table must already exist - automatic table creation is not yet supported.
-    #[configurable(metadata(docs::examples = "analytics/events"))]
-    #[configurable(metadata(docs::examples = "logs/application"))]
-    pub table_path: String,
+    #[configurable(metadata(docs::examples = "gs://my-bucket/analytics/events"))]
+    #[configurable(metadata(docs::examples = "s3://my-bucket/logs/application"))]
+    pub table_uri: String,
 
-    /// GCS service account credentials path.
+    /// Storage-specific options.
     ///
-    /// Path to a JSON file containing the GCS service account key.
-    /// If not provided, the sink will attempt to use default credentials
-    /// from the environment.
-    #[configurable(metadata(docs::examples = "/path/to/service-account-key.json"))]
-    #[configurable(metadata(docs::examples = "/etc/vector/gcs-credentials.json"))]
-    pub credentials_path: Option<String>,
+    /// Configuration options specific to the storage backend:
+    ///
+    /// **For GCS:**
+    /// - `google_service_account`: Path to service account JSON file
+    ///
+    /// **For S3:**
+    /// - `aws_access_key_id`: AWS access key
+    /// - `aws_secret_access_key`: AWS secret key
+    /// - `aws_region`: AWS region (e.g., "us-east-1")
+    /// - `aws_endpoint`: Custom S3 endpoint (for MinIO, LocalStack, etc.)
+    /// - `aws_allow_http`: Allow HTTP connections (for local testing)
+    /// - `aws_s3_path_style`: Use path-style addressing (for MinIO)
+    ///
+    /// If not provided, the sink will use default credentials from the environment.
+    #[serde(default)]
+    pub storage_options: HashMap<String, String>,
 
     /// Batch encoding configuration.
     ///
@@ -102,9 +108,8 @@ fn default_schema_evolution() -> bool {
 impl GenerateConfig for DeltaLakeConfig {
     fn generate_config() -> toml::Value {
         toml::Value::try_from(Self {
-            bucket: "my-bucket".to_string(),
-            table_path: "analytics/events".to_string(),
-            credentials_path: Some("/path/to/service-account.json".to_string()),
+            table_uri: "gs://my-bucket/analytics/events".to_string(),
+            storage_options: HashMap::new(),
             batch_encoding: ArrowStreamSerializerConfig::default(),
             enable_schema_evolution: default_schema_evolution(),
             batch: BatchConfig::default(),
@@ -119,21 +124,34 @@ impl GenerateConfig for DeltaLakeConfig {
 #[typetag::serde(name = "delta_lake")]
 impl SinkConfig for DeltaLakeConfig {
     async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        // 1. Build table URI and storage options for GCS
-        let table_uri_str = format!("gs://{}/{}", self.bucket, self.table_path);
-        let table_uri = Url::parse(&table_uri_str)
-            .map_err(|e| format!("Invalid table URI {}: {}", table_uri_str, e))?;
+        // 1. Parse and validate table URI
+        let table_uri = Url::parse(&self.table_uri)
+            .map_err(|e| format!("Invalid table URI {}: {}", self.table_uri, e))?;
 
-        // Configure storage options for GCS
-        let mut storage_options = HashMap::new();
-        if let Some(creds) = &self.credentials_path {
-            storage_options.insert("google_service_account".to_string(), creds.clone());
+        // Validate URI scheme
+        match table_uri.scheme() {
+            "gs" | "s3" | "s3a" | "file" | "abfs" | "abfss" | "az" => {}
+            scheme => {
+                return Err(format!(
+                    "Unsupported URI scheme '{}'. Supported: gs, s3, s3a, file, abfs, abfss, az",
+                    scheme
+                )
+                .into())
+            }
         }
 
         // 2. Open Delta table with storage options
-        let mut table = deltalake::open_table_with_storage_options(table_uri, storage_options)
-            .await
-            .map_err(|e| format!("Failed to open Delta table at {}: {}", table_uri_str, e))?;
+        let mut table = deltalake::open_table_with_storage_options(
+            table_uri.clone(),
+            self.storage_options.clone(),
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to open Delta table at {}: {}",
+                self.table_uri, e
+            )
+        })?;
 
         // 3. Fetch schema from Delta table
         let mut arrow_config = self.batch_encoding.clone();
@@ -202,11 +220,12 @@ mod tests {
     }
 
     #[test]
-    fn test_config_with_all_fields() {
+    fn test_config_gcs() {
         let config_str = r#"
-            bucket = "test-bucket"
-            table_path = "test/table"
-            credentials_path = "/path/to/creds.json"
+            table_uri = "gs://test-bucket/test/table"
+
+            [storage_options]
+            google_service_account = "/path/to/creds.json"
 
             [batch_encoding]
             allow_nullable_fields = true
@@ -217,25 +236,56 @@ mod tests {
         "#;
 
         let config: DeltaLakeConfig = toml::from_str(config_str).expect("Config should parse");
-        assert_eq!(config.bucket, "test-bucket");
-        assert_eq!(config.table_path, "test/table");
+        assert_eq!(config.table_uri, "gs://test-bucket/test/table");
         assert_eq!(
-            config.credentials_path,
-            Some("/path/to/creds.json".to_string())
+            config.storage_options.get("google_service_account"),
+            Some(&"/path/to/creds.json".to_string())
         );
         assert!(config.batch_encoding.allow_nullable_fields);
     }
 
     #[test]
-    fn test_config_minimal() {
+    fn test_config_s3() {
         let config_str = r#"
-            bucket = "test-bucket"
-            table_path = "test/table"
+            table_uri = "s3://test-bucket/test/table"
+
+            [storage_options]
+            aws_access_key_id = "AKIAIOSFODNN7EXAMPLE"
+            aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+            aws_region = "us-east-1"
         "#;
 
         let config: DeltaLakeConfig = toml::from_str(config_str).expect("Config should parse");
-        assert_eq!(config.bucket, "test-bucket");
-        assert_eq!(config.table_path, "test/table");
-        assert_eq!(config.credentials_path, None);
+        assert_eq!(config.table_uri, "s3://test-bucket/test/table");
+        assert_eq!(
+            config.storage_options.get("aws_region"),
+            Some(&"us-east-1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_config_s3_minio() {
+        let config_str = r#"
+            table_uri = "s3://test-bucket/test/table"
+
+            [storage_options]
+            aws_access_key_id = "minioadmin"
+            aws_secret_access_key = "minioadmin"
+            aws_region = "us-east-1"
+            aws_endpoint = "http://localhost:9000"
+            aws_allow_http = "true"
+            aws_s3_path_style = "true"
+        "#;
+
+        let config: DeltaLakeConfig = toml::from_str(config_str).expect("Config should parse");
+        assert_eq!(config.table_uri, "s3://test-bucket/test/table");
+        assert_eq!(
+            config.storage_options.get("aws_endpoint"),
+            Some(&"http://localhost:9000".to_string())
+        );
+        assert_eq!(
+            config.storage_options.get("aws_allow_http"),
+            Some(&"true".to_string())
+        );
     }
 }

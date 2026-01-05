@@ -270,7 +270,7 @@ aws-types = { version = "1.3.8", default-features = false, optional = true }
 # The sts crate is needed despite not being referred to anywhere in the code because we need to set the
 # `behavior-version-latest` feature. Without this we get a runtime panic when `auth.assume_role` authentication
 # is configured.
-aws-sdk-sts = { version = "1.73.0", default-features = false, features = ["behavior-version-latest", "rt-tokio"], optional = true }
+aws-sdk-sts = { version = "1.95.0", default-features = false, features = ["behavior-version-latest", "rt-tokio"], optional = true }
 
 # The `aws-sdk-sts` crate is needed despite not being referred to anywhere in the code because we need to set the
 # `behavior-version-latest` feature. Without this we get a runtime panic when `auth.assume_role` authentication is configured.
@@ -298,7 +298,7 @@ azure_core_for_storage = { package = "azure_core", version = "0.21.0", default-f
 opendal = { version = "0.54", default-features = false, features = ["services-webhdfs"], optional = true }
 
 # Delta Lake - using 0.29.4 for compatibility
-deltalake = { version = "0.29.4", default-features = false, features = ["gcs", "rustls"], optional = true }
+deltalake = { version = "0.29.4", default-features = false, features = ["gcs", "s3", "rustls"], optional = true }
 
 # Tower
 tower = { version = "0.5.2", default-features = false, features = ["buffer", "limit", "retry", "timeout", "util", "balance", "discover"] }
@@ -914,6 +914,7 @@ all-integration-tests = [
   "chronicle-integration-tests",
   "clickhouse-integration-tests",
   "databend-integration-tests",
+  "delta-lake-integration-tests",
   "datadog-agent-integration-tests",
   "datadog-logs-integration-tests",
   "datadog-metrics-integration-tests",
@@ -980,6 +981,7 @@ azure-blob-integration-tests = ["sinks-azure_blob"]
 chronicle-integration-tests = ["sinks-gcp"]
 clickhouse-integration-tests = ["sinks-clickhouse"]
 databend-integration-tests = ["sinks-databend"]
+delta-lake-integration-tests = ["sinks-delta_lake", "dep:deltalake"]
 datadog-agent-integration-tests = ["sources-datadog_agent"]
 datadog-logs-integration-tests = ["sinks-datadog_logs"]
 datadog-metrics-integration-tests = ["sinks-datadog_metrics", "dep:prost"]
