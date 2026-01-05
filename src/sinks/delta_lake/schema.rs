@@ -15,19 +15,19 @@ use vector_lib::codecs::encoding::format::{ArrowEncodingError, SchemaProvider};
 /// schema conversion. The schema is fetched once at sink startup from the latest
 /// table snapshot.
 #[derive(Clone, Debug)]
-pub struct DeltaLakeSchemaProvider {
-    table: DeltaTable,
+pub struct DeltaLakeSchemaProvider<'a> {
+    table: &'a DeltaTable,
 }
 
-impl DeltaLakeSchemaProvider {
+impl<'a> DeltaLakeSchemaProvider<'a> {
     /// Create a new schema provider for the given Delta table.
-    pub fn new(table: DeltaTable) -> Self {
+    pub fn new(table: &'a DeltaTable) -> Self {
         Self { table }
     }
 }
 
 #[async_trait]
-impl SchemaProvider for DeltaLakeSchemaProvider {
+impl SchemaProvider for DeltaLakeSchemaProvider<'_> {
     async fn get_schema(&self) -> Result<Schema, ArrowEncodingError> {
         // Load the latest table snapshot
         let snapshot = self
@@ -48,17 +48,5 @@ impl SchemaProvider for DeltaLakeSchemaProvider {
             })?;
 
         Ok(arrow_schema)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    // Note: Integration tests with real Delta tables should go in integration_tests.rs
-    // These are just basic unit tests for the schema provider structure
-
-    #[test]
-    fn test_schema_provider_new() {
-        // This test just verifies the struct can be created
-        // Real functionality requires a Delta table which needs integration tests
     }
 }

@@ -1,15 +1,5 @@
 #![cfg(all(test, feature = "delta-lake-integration-tests"))]
 
-//! Integration tests for Delta Lake sink using MinIO as S3-compatible storage.
-//!
-//! These tests verify:
-//! - Basic write operations
-//! - Schema evolution with automatic reload
-//! - Concurrent writes with retry logic
-//! - Large batch handling
-//!
-//! Note: These tests require MinIO to be running. Use `cargo vdev integration test delta-lake`
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -403,7 +393,7 @@ async fn test_delta_lake_basic_write() {
         table_uri,
         storage_options: minio_storage_options(),
         batch_encoding: Default::default(),
-        enable_schema_evolution: true,
+        schema_evolution: true,
         batch: Default::default(),
         request: Default::default(),
         acknowledgements: Default::default(),
@@ -496,7 +486,7 @@ async fn test_delta_lake_schema_evolution() {
         table_uri: table_uri.clone(),
         storage_options: minio_storage_options(),
         batch_encoding: Default::default(),
-        enable_schema_evolution: true,
+        schema_evolution: true,
         batch: Default::default(),
         request: Default::default(),
         acknowledgements: Default::default(),
@@ -593,7 +583,7 @@ async fn test_delta_lake_schema_evolution() {
         table_uri: table_uri.clone(),
         storage_options: minio_storage_options(),
         batch_encoding: Default::default(),
-        enable_schema_evolution: true,
+        schema_evolution: true,
         batch: Default::default(),
         request: Default::default(),
         acknowledgements: Default::default(),
@@ -694,7 +684,7 @@ async fn test_delta_lake_concurrent_writes() {
                 table_uri,
                 storage_options: storage_opts,
                 batch_encoding: Default::default(),
-                enable_schema_evolution: true,
+                schema_evolution: true,
                 batch: Default::default(),
                 request: Default::default(),
                 acknowledgements: Default::default(),
@@ -803,7 +793,7 @@ async fn test_delta_lake_large_batch() {
         table_uri,
         storage_options: minio_storage_options(),
         batch_encoding: Default::default(),
-        enable_schema_evolution: true,
+        schema_evolution: true,
         batch: batch_config,
         request: Default::default(),
         acknowledgements: Default::default(),
@@ -867,5 +857,105 @@ async fn test_delta_lake_large_batch() {
     assert!(ids.contains(&"1499".to_string()), "Missing ID 1499");
 
     println!("Successfully wrote and verified {} events in large batch. Files: {}", num_events, files.len());
+}
+
+#[tokio::test]
+async fn test_delta_lake_schema_inference() {
+    use crate::config::SinkContext;
+    use crate::sinks::delta_lake::DeltaLakeConfig;
+    use crate::test_util::components::run_and_assert_sink_compliance;
+    use futures::stream;
+    use vector_lib::event::{BatchNotifier, BatchStatus, Event, LogEvent};
+
+    // Setup - create unique table for this test
+    let bucket = "test-bucket";
+    let table_path = format!("test-schema-inference-{}", uuid::Uuid::new_v4());
+
+    // Create Delta table with minimal schema (only 'id')
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+    ]));
+
+    create_delta_table(bucket, &table_path, schema.clone()).await;
+
+    // Build sink with auto schema evolution enabled
+    let table_uri = format!("s3://{}/{}", bucket, table_path);
+    let config = DeltaLakeConfig {
+        table_uri,
+        storage_options: minio_storage_options(),
+        batch_encoding: Default::default(),
+        schema_evolution: true, // Enable schema inference and evolution
+        batch: Default::default(),
+        request: Default::default(),
+        acknowledgements: Default::default(),
+    };
+
+    // Build the sink
+    let cx = SinkContext::default();
+    let (sink, _healthcheck) = config.build(cx).await.expect("Failed to build sink");
+
+    // Create test events with extra fields NOT in the table schema
+    let (batch, receiver) = BatchNotifier::new_with_receiver();
+    let events: Vec<Event> = (0..10)
+        .map(|i| {
+            let mut log = LogEvent::default();
+            log.insert("id", i as i64);
+            log.insert("message", format!("test message {}", i)); // Not in schema
+            log.insert("count", (i * 10) as i64);                  // Not in schema
+            log.insert("active", i % 2 == 0);                      // Not in schema (boolean)
+            Event::Log(log)
+        })
+        .collect();
+
+    let events_with_batch = events
+        .into_iter()
+        .map(|e| e.with_batch_notifier(&batch))
+        .collect::<Vec<_>>();
+
+    drop(batch);
+
+    // Write events through the sink
+    run_and_assert_sink_compliance(sink, stream::iter(events_with_batch), &[]).await;
+
+    // Verify delivery
+    assert_eq!(receiver.await, BatchStatus::Delivered);
+
+    // Verify schema evolved to include inferred fields
+    let mut table = open_delta_table(bucket, &table_path).await;
+    table.load().await.expect("Failed to load table");
+
+    let table_schema = table.snapshot().unwrap().schema();
+    let field_names: Vec<&str> = table_schema.fields().map(|f| f.name().as_str()).collect();
+
+    println!("Schema after inference: {:?}", field_names);
+
+    // Original field should exist
+    assert!(field_names.contains(&"id"), "Schema should contain 'id'");
+
+    // Inferred fields should be added
+    assert!(field_names.contains(&"message"), "Schema should contain inferred 'message' field");
+    assert!(field_names.contains(&"count"), "Schema should contain inferred 'count' field");
+    assert!(field_names.contains(&"active"), "Schema should contain inferred 'active' field");
+
+    // Verify data was written correctly
+    let total_rows = assert_data_readable(&table, 10).await;
+    println!("Read back {} rows with inferred schema", total_rows);
+
+    // Verify specific values exist
+    assert_column_value_exists(&table, "message", "test message 5").await;
+
+    // Read count values and verify they are integers
+    let counts = read_column_values(&table, "count").await;
+    assert_eq!(counts.len(), 10);
+    assert!(counts.contains(&"0".to_string()));
+    assert!(counts.contains(&"90".to_string()));
+
+    // Verify booleans were inferred correctly
+    let active_values = read_column_values(&table, "active").await;
+    assert_eq!(active_values.len(), 10);
+    assert!(active_values.contains(&"true".to_string()) || active_values.contains(&"TRUE".to_string()));
+    assert!(active_values.contains(&"false".to_string()) || active_values.contains(&"FALSE".to_string()));
+
+    println!("Schema inference test passed. Inferred fields: message, count, active");
 }
 

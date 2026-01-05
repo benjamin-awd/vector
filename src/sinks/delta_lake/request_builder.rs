@@ -6,13 +6,16 @@
 use std::io;
 use std::sync::Arc;
 
-use arrow::datatypes::Schema;
+use arc_swap::ArcSwap;
+use arrow::datatypes::{Schema, SchemaRef};
 use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
 use vector_lib::codecs::encoding::format::build_record_batch;
 
 use crate::codecs::{BatchSerializer, EncoderKind};
 use crate::sinks::prelude::*;
+
+use super::schema_inference::build_inferred_schema;
 
 /// Request payload for Delta Lake writes.
 ///
@@ -49,6 +52,10 @@ impl crate::event::Finalizable for DeltaLakeRequest {
     }
 }
 
+/// Shared schema reference that can be updated after successful writes.
+/// Uses ArcSwap for lock-free reads with atomic updates.
+pub type SharedSchema = Arc<ArcSwap<Schema>>;
+
 /// Request builder for Delta Lake.
 ///
 /// This builder converts batches of Vector events into Parquet-encoded bytes
@@ -58,6 +65,12 @@ impl crate::event::Finalizable for DeltaLakeRequest {
 pub struct DeltaLakeRequestBuilder {
     /// Encoder that includes the transformer and Arrow batch serializer
     pub encoder: (Transformer, EncoderKind),
+
+    /// Whether to enable automatic schema evolution (infer new fields from events)
+    pub schema_evolution: bool,
+
+    /// Shared schema reference, updated after successful writes by the service
+    pub shared_schema: SharedSchema,
 }
 
 impl RequestBuilder<Vec<Event>> for DeltaLakeRequestBuilder {
@@ -111,17 +124,33 @@ impl RequestBuilder<Vec<Event>> for DeltaLakeRequestBuilder {
             transformed_events.push(event);
         }
 
-        // Get schema from the batch encoder
-        let schema = match &self.encoder.1 {
-            EncoderKind::Batch(batch_encoder) => match batch_encoder.serializer() {
-                BatchSerializer::Arrow(arrow_serializer) => Arc::clone(arrow_serializer.schema()),
-            },
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Delta Lake requires batch Arrow encoding",
-                ))
+        // Get base schema from the shared schema reference (updated after successful writes)
+        // ArcSwap provides lock-free reads
+        let base_schema: SchemaRef = Arc::clone(&self.shared_schema.load());
+
+        // Determine final schema: either base schema or merged with inferred fields
+        let schema = if self.schema_evolution {
+            let inferred = build_inferred_schema(&base_schema, &transformed_events);
+
+            // Log when new fields are discovered
+            let new_fields: Vec<_> = inferred
+                .fields()
+                .iter()
+                .filter(|f| base_schema.field_with_name(f.name()).is_err())
+                .map(|f| f.name().as_str())
+                .collect();
+
+            if !new_fields.is_empty() {
+                info!(
+                    message = "Schema evolution: discovered new fields from events",
+                    new_fields = ?new_fields,
+                    total_fields = inferred.fields().len(),
+                );
             }
+
+            inferred
+        } else {
+            base_schema
         };
 
         // Build RecordBatch using existing Arrow infrastructure

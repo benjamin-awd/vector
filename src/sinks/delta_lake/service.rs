@@ -1,11 +1,7 @@
-//! Tower service for Delta Lake write operations.
-//!
-//! This module implements the service layer that handles actual writes to Delta Lake,
-//! including Parquet file creation and transaction log management.
-
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
+use deltalake::datafusion::datasource::TableProvider;
 use deltalake::operations::write::SchemaMode;
 use deltalake::protocol::SaveMode;
 use deltalake::{DeltaTable, DeltaTableError};
@@ -14,7 +10,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::internal_events::EndpointBytesSent;
 use crate::sinks::prelude::*;
 
-use super::request_builder::DeltaLakeRequest;
+use super::request_builder::{DeltaLakeRequest, SharedSchema};
 
 /// Response from Delta Lake write operations.
 ///
@@ -61,19 +57,21 @@ impl DriverResponse for DeltaLakeResponse {
 /// When schema mismatches are detected, the service will:
 /// 1. Reload the table to get the latest schema
 /// 2. Retry the write operation with schema merge enabled
-/// 3. Allow adding new columns (filled with nulls for existing data)
 #[derive(Clone)]
 pub struct DeltaLakeService {
     table: Arc<RwLock<DeltaTable>>,
-    enable_schema_evolution: bool,
+    schema_evolution: bool,
+    /// Shared schema reference, updated after successful writes
+    shared_schema: SharedSchema,
 }
 
 impl DeltaLakeService {
     /// Create a new Delta Lake service for the given table.
-    pub fn new(table: DeltaTable, enable_schema_evolution: bool) -> Self {
+    pub fn new(table: DeltaTable, schema_evolution: bool, shared_schema: SharedSchema) -> Self {
         Self {
             table: Arc::new(RwLock::new(table)),
-            enable_schema_evolution,
+            schema_evolution,
+            shared_schema,
         }
     }
 
@@ -111,7 +109,8 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
 
     fn call(&mut self, request: DeltaLakeRequest) -> Self::Future {
         let table_lock = Arc::clone(&self.table);
-        let enable_schema_evolution = self.enable_schema_evolution;
+        let schema_evolution = self.schema_evolution;
+        let shared_schema = Arc::clone(&self.shared_schema);
 
         Box::pin(async move {
             // Get a clone of the current table snapshot
@@ -163,7 +162,7 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
 
                 // Enable schema merge when schema evolution is enabled
                 // This allows adding new columns from incoming data
-                if enable_schema_evolution {
+                if schema_evolution {
                     write_builder = write_builder.with_schema_mode(SchemaMode::Merge);
                 }
 
@@ -171,8 +170,9 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                 match write_builder.await {
                     Ok(new_table) => {
                         // Success! Update the cached table to the latest version
-                        // This prevents future requests from starting with stale snapshots
-                        // DeltaTable::write() returns the updated table with new schema if merged
+                        // Only update if our committed version is newer than the cached version
+                        // This prevents "race to the bottom" where slower requests could
+                        // overwrite newer state with older state
                         {
                             let mut table_guard = table_lock.write().map_err(|e| {
                                 DeltaTableError::Generic(format!(
@@ -180,7 +180,24 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                                     e
                                 ))
                             })?;
-                            *table_guard = new_table.clone();
+
+                            let new_version = new_table.version();
+                            let cached_version = table_guard.version();
+
+                            if new_version > cached_version {
+                                // Update table cache
+                                *table_guard = new_table.clone();
+
+                                // Update schema cache while holding table lock to keep them in sync
+                                // TableProvider::schema() returns the Arrow schema directly
+                                shared_schema.store(new_table.schema());
+                            } else {
+                                debug!(
+                                    message = "Skipping cache update - cached version is newer or equal",
+                                    new_version = new_version,
+                                    cached_version = cached_version,
+                                );
+                            }
                         }
 
                         // Get the actual bytes written from the table metadata
@@ -213,7 +230,7 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                         let is_schema_mismatch = Self::is_schema_mismatch_error(&e);
 
                         // Handle schema mismatch errors with reload and retry (if enabled)
-                        if enable_schema_evolution
+                        if schema_evolution
                             && is_schema_mismatch
                             && schema_retry_count < MAX_SCHEMA_RETRIES
                         {
@@ -309,18 +326,5 @@ impl RetryLogic for DeltaLakeRetryLogic {
             // Generic errors - be conservative, don't retry
             _ => false,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    // Note: Retry logic tests would require constructing DeltaTableError variants
-    // which need their dependency types (object_store::Error, arrow::error::ArrowError).
-    // These are better tested in integration tests where the full error flow occurs naturally.
-
-    #[test]
-    fn test_retry_logic_structure() {
-        // Verify the retry logic can be instantiated
-        let _retry_logic = super::DeltaLakeRetryLogic::default();
     }
 }

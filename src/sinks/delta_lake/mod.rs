@@ -7,6 +7,7 @@
 pub mod config;
 pub mod request_builder;
 pub mod schema;
+pub mod schema_inference;
 pub mod service;
 pub mod sink;
 

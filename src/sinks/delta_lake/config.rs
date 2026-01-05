@@ -1,6 +1,9 @@
 //! Configuration for the Delta Lake sink.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 
 use tower::ServiceBuilder;
 use url::Url;
@@ -15,7 +18,7 @@ use crate::sinks::util::{
 };
 use crate::sinks::{prelude::*, Healthcheck};
 
-use super::request_builder::DeltaLakeRequestBuilder;
+use super::request_builder::{DeltaLakeRequestBuilder, SharedSchema};
 use super::schema::DeltaLakeSchemaProvider;
 use super::service::{DeltaLakeRetryLogic, DeltaLakeService};
 use super::sink::DeltaLakeSink;
@@ -68,16 +71,17 @@ pub struct DeltaLakeConfig {
 
     /// Enable automatic schema evolution.
     ///
-    /// When enabled, the sink will automatically handle schema changes in the Delta Lake table:
-    /// - Reload the table schema when write failures indicate schema mismatches
-    /// - Retry writes with updated schema information
-    /// - Allow Delta Lake to merge compatible schema changes (new nullable columns)
+    /// When enabled, the sink will:
+    /// - Discover new fields from incoming events and include them in writes
+    /// - Allow Delta Lake to merge new columns into the table schema
+    /// - Handle external schema changes by reloading and retrying
     ///
-    /// This is useful when multiple writers may be updating the table schema, or when
-    /// the table schema evolves over time. Disable this if you want strict schema enforcement.
+    /// Discovered fields are always nullable since existing table rows won't have them.
+    ///
+    /// Disable this for strict schema enforcement where events must match the table schema exactly.
     #[configurable(metadata(docs::examples = true))]
-    #[serde(default = "default_schema_evolution")]
-    pub enable_schema_evolution: bool,
+    #[serde(default)]
+    pub schema_evolution: bool,
 
     /// Batching behavior configuration.
     ///
@@ -101,17 +105,13 @@ pub struct DeltaLakeConfig {
     pub acknowledgements: AcknowledgementsConfig,
 }
 
-fn default_schema_evolution() -> bool {
-    true
-}
-
 impl GenerateConfig for DeltaLakeConfig {
     fn generate_config() -> toml::Value {
         toml::Value::try_from(Self {
             table_uri: "gs://my-bucket/analytics/events".to_string(),
             storage_options: HashMap::new(),
             batch_encoding: ArrowStreamSerializerConfig::default(),
-            enable_schema_evolution: default_schema_evolution(),
+            schema_evolution: false,
             batch: BatchConfig::default(),
             request: TowerRequestConfig::default(),
             acknowledgements: AcknowledgementsConfig::default(),
@@ -124,11 +124,9 @@ impl GenerateConfig for DeltaLakeConfig {
 #[typetag::serde(name = "delta_lake")]
 impl SinkConfig for DeltaLakeConfig {
     async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        // 1. Parse and validate table URI
         let table_uri = Url::parse(&self.table_uri)
             .map_err(|e| format!("Invalid table URI {}: {}", self.table_uri, e))?;
 
-        // Validate URI scheme
         match table_uri.scheme() {
             "gs" | "s3" | "s3a" | "file" | "abfs" | "abfss" | "az" => {}
             scheme => {
@@ -140,7 +138,6 @@ impl SinkConfig for DeltaLakeConfig {
             }
         }
 
-        // 2. Open Delta table with storage options
         let mut table = deltalake::open_table_with_storage_options(
             table_uri.clone(),
             self.storage_options.clone(),
@@ -153,17 +150,17 @@ impl SinkConfig for DeltaLakeConfig {
             )
         })?;
 
-        // 3. Fetch schema from Delta table
         let mut arrow_config = self.batch_encoding.clone();
-        let schema_provider = DeltaLakeSchemaProvider::new(table.clone());
+        let schema_provider = DeltaLakeSchemaProvider::new(&table);
         let schema = schema_provider
             .get_schema()
             .await
             .map_err(|e| format!("Failed to fetch schema from Delta table: {}", e))?;
 
-        arrow_config.schema = Some(schema);
+        arrow_config.schema = Some(schema.clone());
 
-        // 4. Build encoder
+        let shared_schema: SharedSchema = Arc::new(ArcSwap::from_pointee(schema));
+
         let batch_config = BatchSerializerConfigLib::ArrowStream(arrow_config);
         let arrow_serializer = batch_config
             .build()
@@ -171,25 +168,24 @@ impl SinkConfig for DeltaLakeConfig {
         let batch_serializer = BatchSerializer::Arrow(arrow_serializer);
         let encoder = EncoderKind::Batch(BatchEncoder::new(batch_serializer));
 
-        // 5. Build request builder
         let request_builder = DeltaLakeRequestBuilder {
             encoder: (Transformer::default(), encoder),
+            schema_evolution: self.schema_evolution,
+            shared_schema: Arc::clone(&shared_schema),
         };
 
-        // 6. Build service with retries
-        let service = DeltaLakeService::new(table.clone(), self.enable_schema_evolution);
+        let service = DeltaLakeService::new(table.clone(), self.schema_evolution, shared_schema);
         let service = ServiceBuilder::new()
             .settings(self.request.into_settings(), DeltaLakeRetryLogic::default())
             .service(service);
 
-        // 7. Build sink
         let batch_settings = self
             .batch
             .into_batcher_settings()
             .map_err(|e| format!("Failed to configure batching: {}", e))?;
         let sink = DeltaLakeSink::new(service, request_builder, batch_settings);
 
-        // 8. Healthcheck - verify table is accessible
+        // 9. Healthcheck - verify table is accessible
         let healthcheck = Box::pin(async move {
             table
                 .load()
