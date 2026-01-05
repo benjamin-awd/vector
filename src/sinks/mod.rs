@@ -38,8 +38,6 @@ pub mod clickhouse;
 pub mod console;
 #[cfg(feature = "sinks-databend")]
 pub mod databend;
-#[cfg(feature = "sinks-delta_lake")]
-pub mod delta_lake;
 #[cfg(any(
     feature = "sinks-datadog_events",
     feature = "sinks-datadog_logs",
@@ -47,6 +45,8 @@ pub mod delta_lake;
     feature = "sinks-datadog_traces"
 ))]
 pub mod datadog;
+#[cfg(feature = "sinks-delta_lake")]
+pub mod delta_lake;
 #[cfg(feature = "sinks-elasticsearch")]
 pub mod elasticsearch;
 #[cfg(feature = "sinks-file")]

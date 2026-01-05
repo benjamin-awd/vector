@@ -3,14 +3,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use deltalake::datafusion::prelude::SessionContext;
 use deltalake::arrow::array::Array;
 use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use deltalake::kernel::engine::arrow_conversion::TryFromArrow;
+use deltalake::datafusion::prelude::SessionContext;
 use deltalake::kernel::StructType;
+use deltalake::kernel::engine::arrow_conversion::TryFromArrow;
 use deltalake::operations::create::CreateBuilder;
 use deltalake::protocol::SaveMode;
-use deltalake::{open_table_with_storage_options, DeltaTable};
+use deltalake::{DeltaTable, open_table_with_storage_options};
 use url::Url;
 
 use crate::config::SinkConfig;
@@ -44,11 +44,7 @@ fn minio_storage_options() -> HashMap<String, String> {
 }
 
 /// Create a new Delta Lake table in MinIO
-async fn create_delta_table(
-    bucket: &str,
-    table_path: &str,
-    schema: Arc<Schema>,
-) -> DeltaTable {
+async fn create_delta_table(bucket: &str, table_path: &str, schema: Arc<Schema>) -> DeltaTable {
     let table_uri = format!("s3://{}/{}", bucket, table_path);
     let storage_options = minio_storage_options();
 
@@ -152,7 +148,10 @@ async fn assert_column_value_exists(
         .await
         .expect("Failed to execute filtered SQL query");
 
-    let batches = df.collect().await.expect("Failed to collect filtered results");
+    let batches = df
+        .collect()
+        .await
+        .expect("Failed to collect filtered results");
 
     let matching_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -221,7 +220,10 @@ async fn read_column_values(table: &DeltaTable, column: &str) -> Vec<String> {
         .await
         .expect("Failed to execute column query");
 
-    let batches = df.collect().await.expect("Failed to collect column results");
+    let batches = df
+        .collect()
+        .await
+        .expect("Failed to collect column results");
 
     let mut values = Vec::new();
     for batch in batches {
@@ -432,10 +434,16 @@ async fn test_delta_lake_basic_write() {
     table.load().await.expect("Failed to load table");
 
     // Verify table version increased (data was committed)
-    assert!(table.version().unwrap() > 0, "Table version should be > 0 after write");
+    assert!(
+        table.version().unwrap() > 0,
+        "Table version should be > 0 after write"
+    );
 
     // Verify data was written by checking file URIs
-    let files: Vec<_> = table.get_file_uris().expect("Failed to get file URIs").collect();
+    let files: Vec<_> = table
+        .get_file_uris()
+        .expect("Failed to get file URIs")
+        .collect();
     assert!(!files.is_empty(), "No files written to Delta table");
 
     // Read-path validation: verify data can be read back correctly
@@ -457,7 +465,10 @@ async fn test_delta_lake_basic_write() {
         );
     }
 
-    println!("Successfully wrote and verified {} files to Delta table", files.len());
+    println!(
+        "Successfully wrote and verified {} files to Delta table",
+        files.len()
+    );
 }
 
 #[tokio::test]
@@ -493,7 +504,10 @@ async fn test_delta_lake_schema_evolution() {
     };
 
     let cx = SinkContext::default();
-    let (sink1, _) = config1.build(cx.clone()).await.expect("Failed to build sink1");
+    let (sink1, _) = config1
+        .build(cx.clone())
+        .await
+        .expect("Failed to build sink1");
 
     // Write initial events (only id and name)
     let (batch1, receiver1) = BatchNotifier::new_with_receiver();
@@ -532,7 +546,7 @@ async fn test_delta_lake_schema_evolution() {
 
     // Use Delta Lake's merge operation to add a new column
     // We'll do this by creating a record batch with the new schema and using DeltaTable methods
-    use deltalake::arrow::array::{Int64Array, StringArray, RecordBatch};
+    use deltalake::arrow::array::{Int64Array, RecordBatch, StringArray};
 
     // Create a record batch with the new schema including 'email'
     let evolved_schema = Arc::new(Schema::new(vec![
@@ -552,7 +566,8 @@ async fn test_delta_lake_schema_evolution() {
             Arc::new(name_array),
             Arc::new(email_array),
         ],
-    ).expect("Failed to create record batch");
+    )
+    .expect("Failed to create record batch");
 
     // Write with schema merge enabled using DeltaTable methods directly
     let _result = table
@@ -616,15 +631,24 @@ async fn test_delta_lake_schema_evolution() {
 
     // Verify schema evolved and data was written
     let mut table_final = open_delta_table(bucket, &table_path).await;
-    table_final.load().await.expect("Failed to load final table");
+    table_final
+        .load()
+        .await
+        .expect("Failed to load final table");
 
     let final_schema = table_final.snapshot().unwrap().schema();
     let field_names: Vec<&str> = final_schema.fields().map(|f| f.name().as_str()).collect();
 
     // The schema should include the email field from the manual evolution
     println!("Final schema fields: {:?}", field_names);
-    assert!(field_names.contains(&"email"), "Schema should include 'email' field");
-    assert!(table_final.version().unwrap() >= 2, "Table should have at least 2 versions");
+    assert!(
+        field_names.contains(&"email"),
+        "Schema should include 'email' field"
+    );
+    assert!(
+        table_final.version().unwrap() >= 2,
+        "Table should have at least 2 versions"
+    );
 
     // Read-path validation: verify all data including schema evolution
     // Initial write: 5 rows (id 0-4), schema evolution write: 1 row (id 100), second write: 5 rows (id 5-9)
@@ -732,7 +756,10 @@ async fn test_delta_lake_concurrent_writes() {
 
     // Verify table has multiple versions (concurrent writes succeeded)
     let version = table.version().unwrap();
-    assert!(version > 0, "Table should have commits from concurrent writes");
+    assert!(
+        version > 0,
+        "Table should have commits from concurrent writes"
+    );
 
     // Read-path validation: verify all concurrent writes landed
     let expected_total = num_workers * events_per_worker; // 3 workers * 10 events = 30 rows
@@ -747,11 +774,19 @@ async fn test_delta_lake_concurrent_writes() {
 
     // Read all worker_ids and verify distribution
     let worker_ids = read_column_values(&table, "worker_id").await;
-    assert_eq!(worker_ids.len(), expected_total, "Expected {} total rows", expected_total);
+    assert_eq!(
+        worker_ids.len(),
+        expected_total,
+        "Expected {} total rows",
+        expected_total
+    );
 
     // Count events per worker
     for worker_id in 0..num_workers {
-        let worker_count = worker_ids.iter().filter(|&w| w == &worker_id.to_string()).count();
+        let worker_count = worker_ids
+            .iter()
+            .filter(|&w| w == &worker_id.to_string())
+            .count();
         assert_eq!(
             worker_count, events_per_worker,
             "Worker {} should have {} events, found {}",
@@ -759,7 +794,10 @@ async fn test_delta_lake_concurrent_writes() {
         );
     }
 
-    println!("Concurrent writes completed successfully. Table version: {}. Total rows: {}", version, total_rows);
+    println!(
+        "Concurrent writes completed successfully. Table version: {}. Total rows: {}",
+        version, total_rows
+    );
 }
 
 #[tokio::test]
@@ -834,9 +872,15 @@ async fn test_delta_lake_large_batch() {
     table.load().await.expect("Failed to load table");
 
     // Verify table has data
-    assert!(table.version().unwrap() > 0, "Table should have data written");
+    assert!(
+        table.version().unwrap() > 0,
+        "Table should have data written"
+    );
 
-    let files: Vec<_> = table.get_file_uris().expect("Failed to get file URIs").collect();
+    let files: Vec<_> = table
+        .get_file_uris()
+        .expect("Failed to get file URIs")
+        .collect();
     assert!(!files.is_empty(), "No files written to Delta table");
 
     // Read-path validation: verify all events in large batch are readable
@@ -856,7 +900,11 @@ async fn test_delta_lake_large_batch() {
     assert!(ids.contains(&"0".to_string()), "Missing ID 0");
     assert!(ids.contains(&"1499".to_string()), "Missing ID 1499");
 
-    println!("Successfully wrote and verified {} events in large batch. Files: {}", num_events, files.len());
+    println!(
+        "Successfully wrote and verified {} events in large batch. Files: {}",
+        num_events,
+        files.len()
+    );
 }
 
 #[tokio::test]
@@ -872,9 +920,7 @@ async fn test_delta_lake_schema_inference() {
     let table_path = format!("test-schema-inference-{}", uuid::Uuid::new_v4());
 
     // Create Delta table with minimal schema (only 'id')
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
     create_delta_table(bucket, &table_path, schema.clone()).await;
 
@@ -901,8 +947,8 @@ async fn test_delta_lake_schema_inference() {
             let mut log = LogEvent::default();
             log.insert("id", i as i64);
             log.insert("message", format!("test message {}", i)); // Not in schema
-            log.insert("count", (i * 10) as i64);                  // Not in schema
-            log.insert("active", i % 2 == 0);                      // Not in schema (boolean)
+            log.insert("count", (i * 10) as i64); // Not in schema
+            log.insert("active", i % 2 == 0); // Not in schema (boolean)
             Event::Log(log)
         })
         .collect();
@@ -933,9 +979,18 @@ async fn test_delta_lake_schema_inference() {
     assert!(field_names.contains(&"id"), "Schema should contain 'id'");
 
     // Inferred fields should be added
-    assert!(field_names.contains(&"message"), "Schema should contain inferred 'message' field");
-    assert!(field_names.contains(&"count"), "Schema should contain inferred 'count' field");
-    assert!(field_names.contains(&"active"), "Schema should contain inferred 'active' field");
+    assert!(
+        field_names.contains(&"message"),
+        "Schema should contain inferred 'message' field"
+    );
+    assert!(
+        field_names.contains(&"count"),
+        "Schema should contain inferred 'count' field"
+    );
+    assert!(
+        field_names.contains(&"active"),
+        "Schema should contain inferred 'active' field"
+    );
 
     // Verify data was written correctly
     let total_rows = assert_data_readable(&table, 10).await;
@@ -953,9 +1008,13 @@ async fn test_delta_lake_schema_inference() {
     // Verify booleans were inferred correctly
     let active_values = read_column_values(&table, "active").await;
     assert_eq!(active_values.len(), 10);
-    assert!(active_values.contains(&"true".to_string()) || active_values.contains(&"TRUE".to_string()));
-    assert!(active_values.contains(&"false".to_string()) || active_values.contains(&"FALSE".to_string()));
+    assert!(
+        active_values.contains(&"true".to_string()) || active_values.contains(&"TRUE".to_string())
+    );
+    assert!(
+        active_values.contains(&"false".to_string())
+            || active_values.contains(&"FALSE".to_string())
+    );
 
     println!("Schema inference test passed. Inferred fields: message, count, active");
 }
-

@@ -7,7 +7,9 @@ use arc_swap::ArcSwap;
 
 use tower::ServiceBuilder;
 use url::Url;
-use vector_lib::codecs::encoding::{ArrowStreamSerializerConfig, BatchSerializerConfig as BatchSerializerConfigLib, SchemaProvider};
+use vector_lib::codecs::encoding::{
+    ArrowStreamSerializerConfig, BatchSerializerConfig as BatchSerializerConfigLib, SchemaProvider,
+};
 use vector_lib::configurable::configurable_component;
 use vector_lib::sink::VectorSink;
 
@@ -16,7 +18,7 @@ use crate::config::{AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, S
 use crate::sinks::util::{
     BatchConfig, RealtimeSizeBasedDefaultBatchSettings, ServiceBuilderExt, TowerRequestConfig,
 };
-use crate::sinks::{prelude::*, Healthcheck};
+use crate::sinks::{Healthcheck, prelude::*};
 
 use super::request_builder::{DeltaLakeRequestBuilder, SharedSchema};
 use super::schema::DeltaLakeSchemaProvider;
@@ -134,7 +136,7 @@ impl SinkConfig for DeltaLakeConfig {
                     "Unsupported URI scheme '{}'. Supported: gs, s3, s3a, file, abfs, abfss, az",
                     scheme
                 )
-                .into())
+                .into());
             }
         }
 
@@ -143,12 +145,7 @@ impl SinkConfig for DeltaLakeConfig {
             self.storage_options.clone(),
         )
         .await
-        .map_err(|e| {
-            format!(
-                "Failed to open Delta table at {}: {}",
-                self.table_uri, e
-            )
-        })?;
+        .map_err(|e| format!("Failed to open Delta table at {}: {}", self.table_uri, e))?;
 
         let mut arrow_config = self.batch_encoding.clone();
         let schema_provider = DeltaLakeSchemaProvider::new(&table);
@@ -176,7 +173,7 @@ impl SinkConfig for DeltaLakeConfig {
 
         let service = DeltaLakeService::new(table.clone(), self.schema_evolution, shared_schema);
         let service = ServiceBuilder::new()
-            .settings(self.request.into_settings(), DeltaLakeRetryLogic::default())
+            .settings(self.request.into_settings(), DeltaLakeRetryLogic)
             .service(service);
 
         let batch_settings = self

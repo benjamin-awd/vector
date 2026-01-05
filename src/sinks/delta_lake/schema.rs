@@ -3,10 +3,10 @@
 //! This module implements the `SchemaProvider` trait to fetch Arrow schemas
 //! from existing Delta Lake tables at sink startup.
 
-use deltalake::arrow::datatypes::Schema;
 use async_trait::async_trait;
-use deltalake::kernel::engine::arrow_conversion::TryIntoArrow;
 use deltalake::DeltaTable;
+use deltalake::arrow::datatypes::Schema;
+use deltalake::kernel::engine::arrow_conversion::TryIntoArrow;
 use vector_lib::codecs::encoding::format::{ArrowEncodingError, SchemaProvider};
 
 /// Schema provider that fetches Arrow schema from Delta Lake table metadata.
@@ -21,7 +21,7 @@ pub struct DeltaLakeSchemaProvider<'a> {
 
 impl<'a> DeltaLakeSchemaProvider<'a> {
     /// Create a new schema provider for the given Delta table.
-    pub fn new(table: &'a DeltaTable) -> Self {
+    pub const fn new(table: &'a DeltaTable) -> Self {
         Self { table }
     }
 }
@@ -42,10 +42,11 @@ impl SchemaProvider for DeltaLakeSchemaProvider<'_> {
         let delta_schema = snapshot.schema();
 
         // Convert Delta schema to Arrow schema using TryIntoArrow trait
-        let arrow_schema = delta_schema.as_ref().try_into_arrow()
-            .map_err(|e| ArrowEncodingError::SchemaFetchError {
+        let arrow_schema = delta_schema.as_ref().try_into_arrow().map_err(|e| {
+            ArrowEncodingError::SchemaFetchError {
                 message: format!("Failed to convert Delta schema to Arrow: {}", e),
-            })?;
+            }
+        })?;
 
         Ok(arrow_schema)
     }

@@ -141,9 +141,9 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                 })?;
 
                 // Collect all record batches
-                let batches: Vec<_> = reader
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| DeltaTableError::Generic(format!("Failed to read batches: {}", e)))?;
+                let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>().map_err(|e| {
+                    DeltaTableError::Generic(format!("Failed to read batches: {}", e))
+                })?;
 
                 // Log retry attempt for schema evolution
                 if schema_retry_count > 0 {
@@ -193,7 +193,8 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                                 shared_schema.store(new_table.schema());
                             } else {
                                 debug!(
-                                    message = "Skipping cache update - cached version is newer or equal",
+                                    message =
+                                        "Skipping cache update - cached version is newer or equal",
                                     new_version = new_version,
                                     cached_version = cached_version,
                                 );

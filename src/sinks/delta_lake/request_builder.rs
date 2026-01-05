@@ -160,15 +160,15 @@ impl RequestBuilder<Vec<Event>> for DeltaLakeRequestBuilder {
         // Serialize RecordBatch to Parquet bytes
         let mut buffer = Vec::new();
         let mut writer = ArrowWriter::try_new(&mut buffer, Arc::clone(&schema), None)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         writer
             .write(&record_batch)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         writer
             .close()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         let parquet_bytes = Bytes::from(buffer);
 
