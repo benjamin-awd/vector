@@ -11,6 +11,7 @@ use deltalake::protocol::SaveMode;
 use deltalake::{DeltaTable, DeltaTableError};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+use crate::internal_events::EndpointBytesSent;
 use crate::sinks::prelude::*;
 
 use super::request_builder::DeltaLakeRequest;
@@ -185,6 +186,12 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                         // Get the actual bytes written from the table metadata
                         // For now, estimate based on parquet data size
                         let bytes_written = request.parquet_data.len();
+
+                        emit!(EndpointBytesSent {
+                            byte_size: bytes_written,
+                            protocol: "delta_lake",
+                            endpoint: &table.table_uri(),
+                        });
 
                         return Ok(DeltaLakeResponse {
                             events_byte_size: request
