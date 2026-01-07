@@ -130,25 +130,7 @@ impl RequestBuilder<Vec<Event>> for DeltaLakeRequestBuilder {
 
         // Determine final schema: either base schema or merged with inferred fields
         let schema = if self.schema_evolution {
-            let inferred = build_inferred_schema(&base_schema, &transformed_events);
-
-            // Log when new fields are discovered
-            let new_fields: Vec<_> = inferred
-                .fields()
-                .iter()
-                .filter(|f| base_schema.field_with_name(f.name()).is_err())
-                .map(|f| f.name().as_str())
-                .collect();
-
-            if !new_fields.is_empty() {
-                info!(
-                    message = "Schema evolution: discovered new fields from events",
-                    new_fields = ?new_fields,
-                    total_fields = inferred.fields().len(),
-                );
-            }
-
-            inferred
+            build_inferred_schema(&base_schema, &transformed_events)
         } else {
             base_schema
         };
@@ -187,19 +169,5 @@ impl RequestBuilder<Vec<Event>> for DeltaLakeRequestBuilder {
             finalizers,
             request_metadata,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_request_builder_structure() {
-        // Verify the structure compiles
-        // More comprehensive tests would require setting up a full Arrow encoder
-        // which is better suited for integration tests
-
-        // Note: Creating a real DeltaLakeRequestBuilder requires a full BatchEncoder
-        // with Arrow schema, which is complex to mock. Integration tests should
-        // cover the full request building flow.
     }
 }

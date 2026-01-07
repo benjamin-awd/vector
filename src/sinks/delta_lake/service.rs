@@ -188,9 +188,28 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                                 // Update table cache
                                 *table_guard = new_table.clone();
 
+                                // Log schema evolution if new fields were added
+                                let old_schema = shared_schema.load();
+                                let new_schema = new_table.schema();
+                                let new_fields: Vec<_> = new_schema
+                                    .fields()
+                                    .iter()
+                                    .filter(|f| old_schema.field_with_name(f.name()).is_err())
+                                    .map(|f| f.name().as_str())
+                                    .collect();
+
+                                if !new_fields.is_empty() {
+                                    info!(
+                                        message = "Schema evolution: new fields added to table",
+                                        new_fields = ?new_fields,
+                                        total_fields = new_schema.fields().len(),
+                                        version = new_version,
+                                    );
+                                }
+
                                 // Update schema cache while holding table lock to keep them in sync
                                 // TableProvider::schema() returns the Arrow schema directly
-                                shared_schema.store(new_table.schema());
+                                shared_schema.store(new_schema);
                             } else {
                                 debug!(
                                     message =
