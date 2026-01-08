@@ -173,6 +173,23 @@ pub async fn run_cdf_source(
                         }
                     }
                     Err(e) => {
+                        // Check if this is a "file not found" error (vacuum deleted the files)
+                        if is_file_not_found_error(&e) {
+                            // Auto-recover: reset to latest version (skip unavailable history)
+                            let new_version = latest_version + 1;
+                            warn!(
+                                message = "CDF data files not found (likely removed by VACUUM), skipping to latest",
+                                error = %e,
+                                old_version = current_version,
+                                new_version = new_version,
+                            );
+                            current_version = new_version;
+                            if let Err(e) = checkpointer.write_checkpoint(current_version) {
+                                error!(message = "Failed to save checkpoint", error = %e);
+                            }
+                            continue;
+                        }
+
                         match &e {
                             DeltaTableError::ChangeDataNotEnabled { version } => {
                                 error!(
@@ -183,12 +200,18 @@ pub async fn run_cdf_source(
                                 return Err(());
                             }
                             DeltaTableError::ChangeDataNotRecorded { version, .. } => {
-                                error!(
-                                    message = "CDF data not available for version (may have been removed by VACUUM)",
-                                    %version,
-                                    hint = "Delete checkpoint file to restart from available version",
+                                // Auto-recover: reset to latest version (skip unavailable history)
+                                let new_version = latest_version + 1;
+                                warn!(
+                                    message = "CDF data not available for version (likely removed by VACUUM), skipping to latest",
+                                    unavailable_version = %version,
+                                    new_version = new_version,
                                 );
-                                return Err(());
+                                current_version = new_version;
+                                if let Err(e) = checkpointer.write_checkpoint(current_version) {
+                                    error!(message = "Failed to save checkpoint", error = %e);
+                                }
+                                continue;
                             }
                             DeltaTableError::ChangeDataInvalidVersionRange { start, end } => {
                                 error!(
@@ -235,4 +258,62 @@ async fn load_cdf_data(
     let batches = df.collect().await?;
 
     Ok(batches)
+}
+
+/// Check if an error indicates that files were not found (likely deleted by VACUUM).
+fn is_file_not_found_error(error: &DeltaTableError) -> bool {
+    let error_str = error.to_string();
+    error_str.contains("not found")
+        || error_str.contains("404")
+        || error_str.contains("NoSuchKey")
+        || error_str.contains("NotFound")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detects_s3_not_found_error() {
+        // S3-style error
+        let error = DeltaTableError::Generic(
+            "Failed to parse parquet: External: Object at location ... not found: \
+             Error performing GET ... 404 Not Found: NoSuchKey".to_string()
+        );
+        assert!(is_file_not_found_error(&error));
+    }
+
+    #[test]
+    fn test_detects_gcs_not_found_error() {
+        // GCS-style error (from user's actual error)
+        let error = DeltaTableError::Generic(
+            "Failed to parse parquet: External: Object at location \
+             delta/vector_events/part-00000-xxx.snappy.parquet not found: \
+             Error performing GET https://storage.googleapis.com/... \
+             404 Not Found: NoSuchKey".to_string()
+        );
+        assert!(is_file_not_found_error(&error));
+    }
+
+    #[test]
+    fn test_detects_azure_not_found_error() {
+        // Azure-style error
+        let error = DeltaTableError::Generic(
+            "Object not found: BlobNotFound".to_string()
+        );
+        assert!(is_file_not_found_error(&error));
+    }
+
+    #[test]
+    fn test_does_not_match_unrelated_errors() {
+        let error = DeltaTableError::Generic(
+            "Schema mismatch: expected 5 columns, got 3".to_string()
+        );
+        assert!(!is_file_not_found_error(&error));
+
+        let error = DeltaTableError::Generic(
+            "Connection timeout after 30 seconds".to_string()
+        );
+        assert!(!is_file_not_found_error(&error));
+    }
 }
