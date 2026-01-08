@@ -238,9 +238,6 @@ impl SourceConfig for DeltaLakeCdfConfig {
         .await
         .map_err(|e| format!("Failed to open Delta table at {}: {}", self.table_uri, e))?;
 
-        // Verify CDF is enabled on the table
-        verify_cdf_enabled(&table)?;
-
         // Initialize checkpoint manager
         let data_dir = cx
             .globals
@@ -248,14 +245,7 @@ impl SourceConfig for DeltaLakeCdfConfig {
         let checkpointer = DeltaLakeCdfCheckpointer::new(&data_dir, &self.table_uri);
 
         // Determine starting version
-        let start_version = determine_start_version(&checkpointer, &self.start_position, &table)?;
-
-        info!(
-            message = "Starting Delta Lake CDF source",
-            table_uri = %self.table_uri,
-            start_version = start_version,
-            poll_interval_secs = ?self.poll_interval_secs,
-        );
+        let start_version = determine_start_version(&checkpointer, &self.start_position, &table);
 
         Ok(Box::pin(run_cdf_source(
             table,
@@ -306,67 +296,32 @@ impl SourceConfig for DeltaLakeCdfConfig {
     }
 }
 
-/// Verify that Change Data Feed is enabled on the Delta table.
-fn verify_cdf_enabled(table: &deltalake::DeltaTable) -> crate::Result<()> {
-    let snapshot = table
-        .snapshot()
-        .map_err(|e| format!("Failed to get table snapshot: {}", e))?;
-
-    // Check if CDF is enabled via the table properties
-    let cdf_enabled = snapshot
-        .table_config()
-        .enable_change_data_feed
-        .unwrap_or(false);
-
-    if !cdf_enabled {
-        return Err(format!(
-            "Change Data Feed is not enabled on table '{}'. \
-             Enable it by setting the table property: delta.enableChangeDataFeed = true",
-            table.table_url()
-        )
-        .into());
-    }
-
-    Ok(())
-}
-
 /// Determine the starting version based on checkpoint and configuration.
 fn determine_start_version(
     checkpointer: &DeltaLakeCdfCheckpointer,
     start_position: &StartPosition,
     table: &deltalake::DeltaTable,
-) -> crate::Result<i64> {
+) -> i64 {
     // First check for existing checkpoint
     if let Some(checkpoint_version) = checkpointer.read_checkpoint() {
         info!(
             message = "Resuming from checkpoint",
             version = checkpoint_version,
         );
-
-        // Verify the checkpoint version is still available
-        // Delta Lake tables have an earliest version after VACUUM
-        let earliest_version = 0; // TODO: Get actual earliest version from table
-
-        if checkpoint_version < earliest_version {
-            return Err(format!(
-                "Checkpoint version {} is no longer available (earliest: {}). \
-                 Data may have been lost due to VACUUM. Delete the checkpoint file to start from earliest available version.",
-                checkpoint_version, earliest_version
-            ).into());
-        }
-
-        return Ok(checkpoint_version);
+        // Note: If this version is no longer available (e.g., after VACUUM),
+        // the library will return ChangeDataNotRecorded when we try to read
+        return checkpoint_version;
     }
 
     // No checkpoint, use configured start position
     match start_position {
-        StartPosition::Beginning => Ok(0),
+        StartPosition::Beginning => 0,
         StartPosition::Latest => {
             let version = table.version().unwrap_or(0);
             // Start from next version (don't process current state)
-            Ok(version + 1)
+            version + 1
         }
-        StartPosition::Version(v) => Ok(*v),
+        StartPosition::Version(v) => *v,
     }
 }
 

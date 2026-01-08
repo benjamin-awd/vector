@@ -1,7 +1,9 @@
 //! Main source logic for Delta Lake CDF streaming.
 
+use deltalake::datafusion::prelude::SessionContext;
 use deltalake::delta_datafusion::DeltaCdfTableProvider;
 use deltalake::DeltaTable;
+use deltalake::DeltaTableError;
 use std::sync::Arc;
 use tokio::time::interval;
 use vector_lib::config::LogNamespace;
@@ -36,6 +38,9 @@ pub async fn run_cdf_source(
 ) -> Result<(), ()> {
     let poll_interval = config.poll_interval_secs;
     let mut ticker = interval(poll_interval);
+
+    // Create DataFusion context once for reuse
+    let ctx = SessionContext::new();
 
     // Register metrics
     let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
@@ -110,7 +115,7 @@ pub async fn run_cdf_source(
                 );
 
                 // Load CDF data for the version range
-                match load_cdf_data(&table, current_version, end_version).await {
+                match load_cdf_data(&ctx, &table, current_version, end_version).await {
                     Ok(batches) => {
                         if batches.is_empty() {
                             debug!(message = "No CDF data in version range");
@@ -168,12 +173,39 @@ pub async fn run_cdf_source(
                         }
                     }
                     Err(e) => {
-                        error!(
-                            message = "Failed to load CDF data",
-                            error = %e,
-                            start_version = current_version,
-                            end_version = end_version,
-                        );
+                        match &e {
+                            DeltaTableError::ChangeDataNotEnabled { version } => {
+                                error!(
+                                    message = "Change Data Feed is not enabled on table",
+                                    %version,
+                                    hint = "Enable CDF with: ALTER TABLE ... SET TBLPROPERTIES (delta.enableChangeDataFeed = true)",
+                                );
+                                return Err(());
+                            }
+                            DeltaTableError::ChangeDataNotRecorded { version, .. } => {
+                                error!(
+                                    message = "CDF data not available for version (may have been removed by VACUUM)",
+                                    %version,
+                                    hint = "Delete checkpoint file to restart from available version",
+                                );
+                                return Err(());
+                            }
+                            DeltaTableError::ChangeDataInvalidVersionRange { start, end } => {
+                                error!(
+                                    message = "Invalid CDF version range",
+                                    start_version = %start,
+                                    end_version = %end,
+                                );
+                            }
+                            _ => {
+                                error!(
+                                    message = "Failed to load CDF data",
+                                    error = %e,
+                                    start_version = current_version,
+                                    end_version = end_version,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -183,12 +215,11 @@ pub async fn run_cdf_source(
 
 /// Load Change Data Feed data from Delta table.
 async fn load_cdf_data(
+    ctx: &SessionContext,
     table: &DeltaTable,
     start_version: i64,
     end_version: i64,
-) -> Result<Vec<deltalake::arrow::record_batch::RecordBatch>, deltalake::DeltaTableError> {
-    use deltalake::datafusion::prelude::SessionContext;
-
+) -> Result<Vec<deltalake::arrow::record_batch::RecordBatch>, DeltaTableError> {
     // Clone table and create CDF builder
     let cdf_builder = table
         .clone()
@@ -200,15 +231,8 @@ async fn load_cdf_data(
     let cdf_provider = DeltaCdfTableProvider::try_new(cdf_builder)?;
 
     // Execute the CDF scan using DataFusion
-    let ctx = SessionContext::new();
     let df = ctx.read_table(Arc::new(cdf_provider))?;
     let batches = df.collect().await?;
 
     Ok(batches)
-}
-
-#[cfg(test)]
-mod tests {
-    // Integration tests require a running Delta Lake table
-    // See integration_tests.rs for full end-to-end tests
 }

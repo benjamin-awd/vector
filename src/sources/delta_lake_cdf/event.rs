@@ -11,17 +11,15 @@ use deltalake::arrow::array::{
 };
 use deltalake::arrow::datatypes::DataType;
 use deltalake::arrow::record_batch::RecordBatch;
+use deltalake::delta_datafusion::cdf::{
+    CHANGE_TYPE_COL, COMMIT_TIMESTAMP_COL, COMMIT_VERSION_COL,
+};
 use vector_lib::config::{LegacyKey, LogNamespace};
 use vector_lib::event::{Event, LogEvent};
 use vector_lib::lookup::path;
 use vrl::value::Value;
 
 use super::config::{ChangeType, DeltaLakeCdfConfig};
-
-/// CDF metadata column names in the Arrow schema.
-const CDF_CHANGE_TYPE_COL: &str = "_change_type";
-const CDF_COMMIT_VERSION_COL: &str = "_commit_version";
-const CDF_COMMIT_TIMESTAMP_COL: &str = "_commit_timestamp";
 
 /// Convert a batch of CDF RecordBatches to Vector Events.
 pub fn convert_cdf_batches_to_events(
@@ -54,14 +52,14 @@ fn convert_batch_to_events(
 
     // Find CDF metadata column indices
     let change_type_idx = schema
-        .index_of(CDF_CHANGE_TYPE_COL)
-        .map_err(|_| format!("Missing {} column in CDF data", CDF_CHANGE_TYPE_COL))?;
+        .index_of(CHANGE_TYPE_COL)
+        .map_err(|_| format!("Missing {} column in CDF data", CHANGE_TYPE_COL))?;
     let commit_version_idx = schema
-        .index_of(CDF_COMMIT_VERSION_COL)
-        .map_err(|_| format!("Missing {} column in CDF data", CDF_COMMIT_VERSION_COL))?;
+        .index_of(COMMIT_VERSION_COL)
+        .map_err(|_| format!("Missing {} column in CDF data", COMMIT_VERSION_COL))?;
     let commit_timestamp_idx = schema
-        .index_of(CDF_COMMIT_TIMESTAMP_COL)
-        .map_err(|_| format!("Missing {} column in CDF data", CDF_COMMIT_TIMESTAMP_COL))?;
+        .index_of(COMMIT_TIMESTAMP_COL)
+        .map_err(|_| format!("Missing {} column in CDF data", COMMIT_TIMESTAMP_COL))?;
 
     // Get CDF metadata columns
     let change_type_col = batch.column(change_type_idx);
@@ -100,7 +98,10 @@ fn convert_batch_to_events(
                 let field_name = field.name();
 
                 // Skip CDF metadata columns (already handled above)
-                if field_name.starts_with('_') {
+                if field_name == CHANGE_TYPE_COL
+                    || field_name == COMMIT_VERSION_COL
+                    || field_name == COMMIT_TIMESTAMP_COL
+                {
                     continue;
                 }
 
