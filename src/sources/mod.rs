@@ -15,6 +15,8 @@ pub mod aws_s3;
 pub mod aws_sqs;
 #[cfg(feature = "sources-datadog_agent")]
 pub mod datadog_agent;
+#[cfg(feature = "sources-delta_lake_cdf")]
+pub mod delta_lake_cdf;
 #[cfg(feature = "sources-demo_logs")]
 pub mod demo_logs;
 #[cfg(feature = "sources-dnstap")]

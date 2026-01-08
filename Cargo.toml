@@ -607,6 +607,7 @@ sources-logs = [
   "sources-aws_s3",
   "sources-aws_sqs",
   "sources-datadog_agent",
+  "sources-delta_lake_cdf",
   "sources-demo_logs",
   "sources-docker_logs",
   "sources-exec",
@@ -659,6 +660,7 @@ sources-aws_kinesis_firehose = ["dep:base64"]
 sources-aws_s3 = ["aws-core", "dep:aws-sdk-sqs", "dep:aws-sdk-s3", "dep:async-compression", "sources-aws_sqs", "tokio-util/io"]
 sources-aws_sqs = ["aws-core", "dep:aws-sdk-sqs"]
 sources-datadog_agent = ["sources-utils-http-encoding", "protobuf-build", "dep:prost"]
+sources-delta_lake_cdf = ["dep:deltalake", "codecs-arrow", "dep:parquet"]
 sources-demo_logs = ["dep:fakedata"]
 sources-dnstap = ["sources-utils-net-tcp", "dep:base64", "dep:hickory-proto", "dep:dnsmsg-parser", "dep:dnstap-parser", "protobuf-build", "dep:prost"]
 sources-docker_logs = ["docker"]
@@ -982,6 +984,7 @@ chronicle-integration-tests = ["sinks-gcp"]
 clickhouse-integration-tests = ["sinks-clickhouse"]
 databend-integration-tests = ["sinks-databend"]
 delta-lake-integration-tests = ["sinks-delta_lake", "dep:deltalake"]
+delta-lake-cdf-integration-tests = ["sources-delta_lake_cdf", "dep:deltalake"]
 datadog-agent-integration-tests = ["sources-datadog_agent"]
 datadog-logs-integration-tests = ["sinks-datadog_logs"]
 datadog-metrics-integration-tests = ["sinks-datadog_metrics", "dep:prost"]
