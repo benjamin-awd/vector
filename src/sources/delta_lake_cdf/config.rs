@@ -238,6 +238,23 @@ impl SourceConfig for DeltaLakeCdfConfig {
         .await
         .map_err(|e| format!("Failed to open Delta table at {}: {}", self.table_uri, e))?;
 
+        // Verify Change Data Feed is enabled on the table
+        let cdf_enabled = table
+            .snapshot()
+            .map_err(|e| format!("Failed to get table snapshot: {}", e))?
+            .table_config()
+            .enable_change_data_feed
+            .unwrap_or(false);
+
+        if !cdf_enabled {
+            return Err(format!(
+                "Change Data Feed is not enabled on table '{}'. \
+                 Set table property 'delta.enableChangeDataFeed' to 'true'.",
+                self.table_uri
+            )
+            .into());
+        }
+
         // Initialize checkpoint manager
         let data_dir = cx
             .globals
@@ -302,14 +319,11 @@ fn determine_start_version(
     start_position: &StartPosition,
     table: &deltalake::DeltaTable,
 ) -> i64 {
-    // First check for existing checkpoint
     if let Some(checkpoint_version) = checkpointer.read_checkpoint() {
         info!(
             message = "Resuming from checkpoint",
             version = checkpoint_version,
         );
-        // Note: If this version is no longer available (e.g., after VACUUM),
-        // the library will return ChangeDataNotRecorded when we try to read
         return checkpoint_version;
     }
 
