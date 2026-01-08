@@ -138,8 +138,7 @@ mod tests {
     #[test]
     fn test_checkpoint_roundtrip() {
         let temp_dir = TempDir::new().unwrap();
-        let checkpointer =
-            DeltaLakeCdfCheckpointer::new(temp_dir.path(), "s3://bucket/table");
+        let checkpointer = DeltaLakeCdfCheckpointer::new(temp_dir.path(), "s3://bucket/table");
 
         // Initially no checkpoint
         assert!(checkpointer.read_checkpoint().is_none());
@@ -160,21 +159,18 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         // Write checkpoint for one table
-        let checkpointer1 =
-            DeltaLakeCdfCheckpointer::new(temp_dir.path(), "s3://bucket/table1");
+        let checkpointer1 = DeltaLakeCdfCheckpointer::new(temp_dir.path(), "s3://bucket/table1");
         checkpointer1.write_checkpoint(42).unwrap();
 
         // Try to read with different table URI
-        let checkpointer2 =
-            DeltaLakeCdfCheckpointer::new(temp_dir.path(), "s3://bucket/table2");
+        let checkpointer2 = DeltaLakeCdfCheckpointer::new(temp_dir.path(), "s3://bucket/table2");
         assert!(checkpointer2.read_checkpoint().is_none());
     }
 
     #[test]
     fn test_checkpoint_file_format() {
         let temp_dir = TempDir::new().unwrap();
-        let checkpointer =
-            DeltaLakeCdfCheckpointer::new(temp_dir.path(), "s3://bucket/table");
+        let checkpointer = DeltaLakeCdfCheckpointer::new(temp_dir.path(), "s3://bucket/table");
 
         checkpointer.write_checkpoint(42).unwrap();
 
@@ -190,8 +186,7 @@ mod tests {
     #[test]
     fn test_checkpoint_corrupt_file() {
         let temp_dir = TempDir::new().unwrap();
-        let checkpointer =
-            DeltaLakeCdfCheckpointer::new(temp_dir.path(), "s3://bucket/table");
+        let checkpointer = DeltaLakeCdfCheckpointer::new(temp_dir.path(), "s3://bucket/table");
 
         // Write corrupt data
         std::fs::write(checkpointer.checkpoint_path(), "not valid json").unwrap();
@@ -204,8 +199,7 @@ mod tests {
     fn test_checkpoint_missing_dir() {
         let temp_dir = TempDir::new().unwrap();
         let nested_path = temp_dir.path().join("nested").join("dir");
-        let checkpointer =
-            DeltaLakeCdfCheckpointer::new(&nested_path, "s3://bucket/table");
+        let checkpointer = DeltaLakeCdfCheckpointer::new(&nested_path, "s3://bucket/table");
 
         // Should create parent directories
         checkpointer.write_checkpoint(42).unwrap();

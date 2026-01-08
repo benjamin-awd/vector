@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use deltalake::DeltaTable;
 use deltalake::arrow::array::{Int64Builder, StringBuilder};
 use deltalake::arrow::datatypes::{DataType, Field, Schema};
 use deltalake::arrow::record_batch::RecordBatch;
@@ -16,7 +17,6 @@ use deltalake::kernel::StructType;
 use deltalake::kernel::engine::arrow_conversion::TryFromArrow;
 use deltalake::operations::create::CreateBuilder;
 use deltalake::protocol::SaveMode;
-use deltalake::DeltaTable;
 
 use super::config::{DeltaLakeCdfConfig, StartPosition};
 
@@ -167,8 +167,8 @@ async fn test_auto_recovery_after_vacuum() {
 
     use super::checkpoint::DeltaLakeCdfCheckpointer;
     use super::source::run_cdf_source;
-    use crate::shutdown::ShutdownSignal;
     use crate::SourceSender;
+    use crate::shutdown::ShutdownSignal;
     use vector_lib::config::LogNamespace;
 
     // Create unique table path

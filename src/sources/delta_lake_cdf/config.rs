@@ -279,33 +279,35 @@ impl SourceConfig for DeltaLakeCdfConfig {
         let log_namespace = global_log_namespace.merge(self.log_namespace);
 
         // Define the schema for CDF events
-        let schema_definition = vector_lib::schema::Definition::default_for_namespace(
-            &[log_namespace].into(),
-        )
-        .with_standard_vector_source_metadata()
-        .with_source_metadata(
-            DeltaLakeCdfConfig::NAME,
-            Some(LegacyKey::Overwrite(owned_value_path!("_change_type"))),
-            &owned_value_path!("change_type"),
-            Kind::bytes(),
-            Some("change_type"),
-        )
-        .with_source_metadata(
-            DeltaLakeCdfConfig::NAME,
-            Some(LegacyKey::Overwrite(owned_value_path!("_commit_version"))),
-            &owned_value_path!("commit_version"),
-            Kind::integer(),
-            Some("commit_version"),
-        )
-        .with_source_metadata(
-            DeltaLakeCdfConfig::NAME,
-            Some(LegacyKey::Overwrite(owned_value_path!("_commit_timestamp"))),
-            &owned_value_path!("commit_timestamp"),
-            Kind::timestamp(),
-            Some("commit_timestamp"),
-        );
+        let schema_definition =
+            vector_lib::schema::Definition::default_for_namespace(&[log_namespace].into())
+                .with_standard_vector_source_metadata()
+                .with_source_metadata(
+                    DeltaLakeCdfConfig::NAME,
+                    Some(LegacyKey::Overwrite(owned_value_path!("_change_type"))),
+                    &owned_value_path!("change_type"),
+                    Kind::bytes(),
+                    Some("change_type"),
+                )
+                .with_source_metadata(
+                    DeltaLakeCdfConfig::NAME,
+                    Some(LegacyKey::Overwrite(owned_value_path!("_commit_version"))),
+                    &owned_value_path!("commit_version"),
+                    Kind::integer(),
+                    Some("commit_version"),
+                )
+                .with_source_metadata(
+                    DeltaLakeCdfConfig::NAME,
+                    Some(LegacyKey::Overwrite(owned_value_path!("_commit_timestamp"))),
+                    &owned_value_path!("commit_timestamp"),
+                    Kind::timestamp(),
+                    Some("commit_timestamp"),
+                );
 
-        vec![SourceOutput::new_maybe_logs(DataType::Log, schema_definition)]
+        vec![SourceOutput::new_maybe_logs(
+            DataType::Log,
+            schema_definition,
+        )]
     }
 
     fn can_acknowledge(&self) -> bool {

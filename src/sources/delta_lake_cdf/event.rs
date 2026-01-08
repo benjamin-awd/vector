@@ -4,16 +4,14 @@ use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 use deltalake::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
     LargeStringArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array,
-    UInt8Array,
+    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use deltalake::arrow::datatypes::DataType;
 use deltalake::arrow::record_batch::RecordBatch;
-use deltalake::delta_datafusion::cdf::{
-    CHANGE_TYPE_COL, COMMIT_TIMESTAMP_COL, COMMIT_VERSION_COL,
-};
+use deltalake::delta_datafusion::cdf::{CHANGE_TYPE_COL, COMMIT_TIMESTAMP_COL, COMMIT_VERSION_COL};
 use vector_lib::config::{LegacyKey, LogNamespace};
 use vector_lib::event::{Event, LogEvent};
 use vector_lib::lookup::path;
@@ -72,12 +70,11 @@ fn convert_batch_to_events(
             .ok_or_else(|| format!("Null change_type at row {}", row_idx))?;
 
         // Filter by change type if specified
-        if !config.change_types.is_empty() {
-            if let Some(ct) = ChangeType::from_cdf_string(&change_type_str) {
-                if !config.change_types.contains(&ct) {
-                    continue;
-                }
-            }
+        if !config.change_types.is_empty()
+            && let Some(ct) = ChangeType::from_cdf_string(&change_type_str)
+            && !config.change_types.contains(&ct)
+        {
+            continue;
         }
 
         let mut log = LogEvent::default();
@@ -306,7 +303,7 @@ fn arrow_value_to_vrl(
 
         // Timestamps
         DataType::Timestamp(unit, _tz) => {
-            let ts = extract_timestamp_by_unit(column, row_idx, unit)
+            let ts = extract_timestamp_by_unit(column, row_idx, *unit)
                 .ok_or("Failed to extract timestamp")?;
             Ok(Value::Timestamp(ts))
         }
@@ -399,7 +396,7 @@ fn extract_timestamp(column: &ArrayRef, row_idx: usize) -> Option<DateTime<Utc>>
     }
 
     match column.data_type() {
-        DataType::Timestamp(unit, _) => extract_timestamp_by_unit(column, row_idx, unit),
+        DataType::Timestamp(unit, _) => extract_timestamp_by_unit(column, row_idx, *unit),
         DataType::Int64 => {
             // Assume milliseconds if stored as plain Int64
             let arr = column.as_any().downcast_ref::<Int64Array>()?;
@@ -413,7 +410,7 @@ fn extract_timestamp(column: &ArrayRef, row_idx: usize) -> Option<DateTime<Utc>>
 fn extract_timestamp_by_unit(
     column: &ArrayRef,
     row_idx: usize,
-    unit: &deltalake::arrow::datatypes::TimeUnit,
+    unit: deltalake::arrow::datatypes::TimeUnit,
 ) -> Option<DateTime<Utc>> {
     use deltalake::arrow::datatypes::TimeUnit;
 
@@ -438,9 +435,7 @@ fn extract_timestamp_by_unit(
             Utc.timestamp_opt(secs, nanos).single()
         }
         TimeUnit::Nanosecond => {
-            let arr = column
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()?;
+            let arr = column.as_any().downcast_ref::<TimestampNanosecondArray>()?;
             let nanos = arr.value(row_idx);
             let secs = nanos / 1_000_000_000;
             let subsec_nanos = (nanos % 1_000_000_000) as u32;

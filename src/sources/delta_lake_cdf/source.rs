@@ -1,20 +1,20 @@
 //! Main source logic for Delta Lake CDF streaming.
 
-use deltalake::datafusion::prelude::SessionContext;
-use deltalake::delta_datafusion::DeltaCdfTableProvider;
 use deltalake::DeltaTable;
 use deltalake::DeltaTableError;
+use deltalake::datafusion::prelude::SessionContext;
+use deltalake::delta_datafusion::DeltaCdfTableProvider;
 use std::sync::Arc;
 use tokio::time::interval;
+use vector_lib::EstimatedJsonEncodedSizeOf;
 use vector_lib::config::LogNamespace;
 use vector_lib::internal_event::{
     ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol,
 };
-use vector_lib::EstimatedJsonEncodedSizeOf;
 
+use crate::SourceSender;
 use crate::internal_events::{EventsReceived, StreamClosedError};
 use crate::shutdown::ShutdownSignal;
-use crate::SourceSender;
 
 use super::checkpoint::DeltaLakeCdfCheckpointer;
 use super::config::DeltaLakeCdfConfig;
@@ -82,14 +82,14 @@ pub async fn run_cdf_source(
                 let latest_version = table.version().unwrap_or(0);
 
                 // Check for bounded read completion
-                if let Some(end_version) = config.ending_version {
-                    if current_version > end_version {
-                        info!(
-                            message = "Reached ending version, stopping",
-                            ending_version = end_version,
-                        );
-                        return Ok(());
-                    }
+                if let Some(end_version) = config.ending_version
+                    && current_version > end_version
+                {
+                    info!(
+                        message = "Reached ending version, stopping",
+                        ending_version = end_version,
+                    );
+                    return Ok(());
                 }
 
                 // Skip if no new versions
@@ -143,7 +143,7 @@ pub async fn run_cdf_source(
                                 events_received.emit(CountByteSize(event_count, json_size));
 
                                 // Send events downstream
-                                if let Err(_) = out.send_batch(events).await {
+                                if out.send_batch(events).await.is_err() {
                                     emit!(StreamClosedError { count: event_count });
                                     return Err(());
                                 }
