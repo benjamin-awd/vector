@@ -278,7 +278,8 @@ mod tests {
         // S3-style error
         let error = DeltaTableError::Generic(
             "Failed to parse parquet: External: Object at location ... not found: \
-             Error performing GET ... 404 Not Found: NoSuchKey".to_string()
+             Error performing GET ... 404 Not Found: NoSuchKey"
+                .to_string(),
         );
         assert!(is_file_not_found_error(&error));
     }
@@ -290,7 +291,8 @@ mod tests {
             "Failed to parse parquet: External: Object at location \
              delta/vector_events/part-00000-xxx.snappy.parquet not found: \
              Error performing GET https://storage.googleapis.com/... \
-             404 Not Found: NoSuchKey".to_string()
+             404 Not Found: NoSuchKey"
+                .to_string(),
         );
         assert!(is_file_not_found_error(&error));
     }
@@ -298,22 +300,17 @@ mod tests {
     #[test]
     fn test_detects_azure_not_found_error() {
         // Azure-style error
-        let error = DeltaTableError::Generic(
-            "Object not found: BlobNotFound".to_string()
-        );
+        let error = DeltaTableError::Generic("Object not found: BlobNotFound".to_string());
         assert!(is_file_not_found_error(&error));
     }
 
     #[test]
     fn test_does_not_match_unrelated_errors() {
-        let error = DeltaTableError::Generic(
-            "Schema mismatch: expected 5 columns, got 3".to_string()
-        );
+        let error =
+            DeltaTableError::Generic("Schema mismatch: expected 5 columns, got 3".to_string());
         assert!(!is_file_not_found_error(&error));
 
-        let error = DeltaTableError::Generic(
-            "Connection timeout after 30 seconds".to_string()
-        );
+        let error = DeltaTableError::Generic("Connection timeout after 30 seconds".to_string());
         assert!(!is_file_not_found_error(&error));
     }
 }
