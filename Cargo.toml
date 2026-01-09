@@ -348,7 +348,6 @@ apache-avro = { version = "0.16.0", default-features = false, optional = true }
 # Updated to 57.1.0 for compatibility with deltalake 0.30.0
 arrow = { version = "57.1.0", default-features = false, features = ["ipc"], optional = true }
 arrow-schema = { version = "57.1.0", default-features = false, optional = true }
-parquet = { version = "57.1.0", default-features = false, features = ["arrow"], optional = true }
 axum = { version = "0.6.20", default-features = false }
 base64 = { workspace = true, optional = true }
 bloomy = { version = "1.2.0", default-features = false, optional = true }
@@ -660,7 +659,7 @@ sources-aws_kinesis_firehose = ["dep:base64"]
 sources-aws_s3 = ["aws-core", "dep:aws-sdk-sqs", "dep:aws-sdk-s3", "dep:async-compression", "sources-aws_sqs", "tokio-util/io"]
 sources-aws_sqs = ["aws-core", "dep:aws-sdk-sqs"]
 sources-datadog_agent = ["sources-utils-http-encoding", "protobuf-build", "dep:prost"]
-sources-delta_lake_cdf = ["dep:deltalake", "codecs-arrow", "dep:parquet"]
+sources-delta_lake_cdf = ["dep:deltalake", "codecs-arrow"]
 sources-demo_logs = ["dep:fakedata"]
 sources-dnstap = ["sources-utils-net-tcp", "dep:base64", "dep:hickory-proto", "dep:dnsmsg-parser", "dep:dnstap-parser", "protobuf-build", "dep:prost"]
 sources-docker_logs = ["docker"]
@@ -864,7 +863,7 @@ sinks-chronicle = []
 sinks-clickhouse = ["dep:rust_decimal", "codecs-arrow"]
 sinks-console = []
 sinks-databend = ["dep:databend-client"]
-sinks-delta_lake = ["dep:deltalake", "codecs-arrow", "dep:opendal", "dep:parquet", "dep:arc-swap"]
+sinks-delta_lake = ["dep:deltalake", "codecs-arrow", "dep:opendal", "dep:arc-swap"]
 sinks-datadog_events = []
 sinks-datadog_logs = []
 sinks-datadog_metrics = ["protobuf-build", "dep:prost", "dep:prost-reflect"]

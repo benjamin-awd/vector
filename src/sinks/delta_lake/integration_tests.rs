@@ -390,12 +390,13 @@ async fn test_delta_lake_basic_write() {
     create_delta_table(bucket, &table_path, schema.clone()).await;
 
     // Build sink configuration
+    // Using allow_nullable_fields: false to test strict schema enforcement
     let table_uri = format!("s3://{}/{}", bucket, table_path);
     let config = DeltaLakeConfig {
         table_uri,
         storage_options: minio_storage_options(),
-        batch_encoding: Default::default(),
-        schema_evolution: true,
+        allow_nullable_fields: false,
+        schema_evolution: false,
         batch: Default::default(),
         request: Default::default(),
         acknowledgements: Default::default(),
@@ -405,7 +406,7 @@ async fn test_delta_lake_basic_write() {
     let cx = SinkContext::default();
     let (sink, _healthcheck) = config.build(cx).await.expect("Failed to build sink");
 
-    // Create test events
+    // Create test events with all required fields
     let (batch, receiver) = BatchNotifier::new_with_receiver();
     let events: Vec<Event> = (0..10)
         .map(|i| {
@@ -496,7 +497,7 @@ async fn test_delta_lake_schema_evolution() {
     let config1 = DeltaLakeConfig {
         table_uri: table_uri.clone(),
         storage_options: minio_storage_options(),
-        batch_encoding: Default::default(),
+        allow_nullable_fields: true,
         schema_evolution: true,
         batch: Default::default(),
         request: Default::default(),
@@ -597,7 +598,7 @@ async fn test_delta_lake_schema_evolution() {
     let config2 = DeltaLakeConfig {
         table_uri: table_uri.clone(),
         storage_options: minio_storage_options(),
-        batch_encoding: Default::default(),
+        allow_nullable_fields: true,
         schema_evolution: true,
         batch: Default::default(),
         request: Default::default(),
@@ -707,7 +708,7 @@ async fn test_delta_lake_concurrent_writes() {
             let config = DeltaLakeConfig {
                 table_uri,
                 storage_options: storage_opts,
-                batch_encoding: Default::default(),
+                allow_nullable_fields: true,
                 schema_evolution: true,
                 batch: Default::default(),
                 request: Default::default(),
@@ -830,7 +831,7 @@ async fn test_delta_lake_large_batch() {
     let config = DeltaLakeConfig {
         table_uri,
         storage_options: minio_storage_options(),
-        batch_encoding: Default::default(),
+        allow_nullable_fields: true,
         schema_evolution: true,
         batch: batch_config,
         request: Default::default(),
@@ -929,7 +930,7 @@ async fn test_delta_lake_schema_inference() {
     let config = DeltaLakeConfig {
         table_uri,
         storage_options: minio_storage_options(),
-        batch_encoding: Default::default(),
+        allow_nullable_fields: true,
         schema_evolution: true, // Enable schema inference and evolution
         batch: Default::default(),
         request: Default::default(),

@@ -5,7 +5,6 @@ use deltalake::datafusion::datasource::TableProvider;
 use deltalake::operations::write::SchemaMode;
 use deltalake::protocol::SaveMode;
 use deltalake::{DeltaTable, DeltaTableError};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tokio::sync::RwLock;
 
 use crate::internal_events::EndpointBytesSent;
@@ -45,9 +44,8 @@ impl DriverResponse for DeltaLakeResponse {
 
 /// Tower service for Delta Lake writes.
 ///
-/// This service handles the conversion of Parquet bytes back to RecordBatch,
-/// then uses Delta Lake's RecordBatchWriter to create Parquet files and
-/// transaction log entries.
+/// This service writes Arrow RecordBatches directly to Delta Lake tables,
+/// avoiding the overhead of Parquet serialization/deserialization round-trips.
 ///
 /// The table is wrapped in RwLock to allow updating the cached snapshot after
 /// successful commits, reducing unnecessary conflict retries.
@@ -114,11 +112,15 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
         let shared_schema = Arc::clone(&self.shared_schema);
 
         Box::pin(async move {
+            // Use batches directly from request - no Parquet deserialization needed
+            let batches = request.batches;
+
             // Get a clone of the current table snapshot
             let mut table = {
                 let table_guard = table_lock.read().await;
                 table_guard.clone()
             };
+
             // Retry loop for handling concurrent transaction conflicts and schema evolution
             // When optimization operations (like z-order) rewrite files, or when schema changes,
             // we need to reload the table snapshot and retry the write
@@ -128,22 +130,6 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
             let mut schema_retry_count = 0;
 
             loop {
-                // Deserialize Parquet bytes back to RecordBatch
-                // Use Bytes directly as it implements ChunkReader
-                let bytes = request.parquet_data.clone();
-                let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|e| {
-                    DeltaTableError::Generic(format!("Failed to create Parquet reader: {}", e))
-                })?;
-
-                let reader = builder.build().map_err(|e| {
-                    DeltaTableError::Generic(format!("Failed to build Parquet reader: {}", e))
-                })?;
-
-                // Collect all record batches
-                let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>().map_err(|e| {
-                    DeltaTableError::Generic(format!("Failed to read batches: {}", e))
-                })?;
-
                 // Log retry attempt for schema evolution
                 if schema_retry_count > 0 {
                     info!(
@@ -154,9 +140,10 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
 
                 // Build write operation using DeltaTable methods directly
                 // This supports schema merge mode for true schema evolution
+                // Clone batches for potential retries (RecordBatch clone is cheap - uses Arc internally)
                 let mut write_builder = table
                     .clone()
-                    .write(batches)
+                    .write(batches.clone())
                     .with_save_mode(SaveMode::Append);
 
                 // Enable schema merge when schema evolution is enabled
@@ -216,9 +203,8 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                             }
                         }
 
-                        // Get the actual bytes written from the table metadata
-                        // For now, estimate based on parquet data size
-                        let bytes_written = request.parquet_data.len();
+                        // Get the byte size from the request (Arrow in-memory size)
+                        let bytes_written = request.byte_size;
 
                         emit!(EndpointBytesSent {
                             byte_size: bytes_written,

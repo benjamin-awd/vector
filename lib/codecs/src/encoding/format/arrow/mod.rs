@@ -239,8 +239,11 @@ pub fn encode_events_to_arrow_ipc_stream(
     Ok(buffer.into_inner().freeze())
 }
 
-/// Recursively makes a Field and all its nested fields nullable
-fn make_field_nullable(field: &arrow::datatypes::Field) -> arrow::datatypes::Field {
+/// Recursively makes a Field and all its nested fields nullable.
+///
+/// This is useful for schema evolution scenarios where new fields need to be nullable,
+/// or when events may have missing fields that should be represented as null.
+pub fn make_field_nullable(field: &arrow::datatypes::Field) -> arrow::datatypes::Field {
     let new_data_type = match field.data_type() {
         DataType::List(inner_field) => DataType::List(make_field_nullable(inner_field).into()),
         DataType::Struct(fields) => {

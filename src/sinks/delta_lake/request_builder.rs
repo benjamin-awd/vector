@@ -1,39 +1,51 @@
 //! Request builder for Delta Lake sink.
 //!
-//! This module implements the request builder that converts batches of Vector events
-//! into Parquet-encoded bytes suitable for writing to Delta Lake tables.
+//! This module converts batches of Vector events into Arrow RecordBatches
+//! for writing to Delta Lake tables.
 
 use std::io;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use arrow::datatypes::{Schema, SchemaRef};
-use bytes::Bytes;
-use parquet::arrow::ArrowWriter;
-use vector_lib::codecs::encoding::format::build_record_batch;
+use arrow::array::RecordBatch;
+use arrow::datatypes::{FieldRef, Schema, SchemaRef};
+use vector_lib::codecs::encoding::format::{build_record_batch, make_field_nullable};
 
-use crate::codecs::{BatchSerializer, EncoderKind};
 use crate::sinks::prelude::*;
 
 use super::schema_inference::build_inferred_schema;
 
+/// Transform a schema to make all fields nullable.
+fn make_schema_nullable(schema: &Schema) -> Schema {
+    Schema::new_with_metadata(
+        schema
+            .fields()
+            .iter()
+            .map(|f| make_field_nullable(f).into())
+            .collect::<Vec<FieldRef>>(),
+        schema.metadata().clone(),
+    )
+}
+
 /// Request payload for Delta Lake writes.
 ///
-/// Contains Parquet-encoded data along with the schema and metadata needed
-/// for acknowledgments and metrics.
+/// Contains Arrow RecordBatches ready for writing to Delta Lake.
+/// By passing RecordBatches directly (instead of serializing to Parquet and back),
+/// we avoid an expensive serialization round-trip.
 #[derive(Clone)]
 pub struct DeltaLakeRequest {
-    /// Parquet-encoded data (RecordBatch serialized to Parquet format)
-    pub parquet_data: Bytes,
-
-    /// Schema for deserialization (stored separately from Parquet data)
-    pub schema: Arc<Schema>,
+    /// Arrow RecordBatches to write
+    pub batches: Vec<RecordBatch>,
 
     /// Event finalizers for acknowledgments
     pub finalizers: EventFinalizers,
 
     /// Request metadata for metrics
     pub request_metadata: RequestMetadata,
+
+    /// Byte size of the batches (for metrics)
+    pub byte_size: usize,
 }
 
 impl MetaDescriptive for DeltaLakeRequest {
@@ -58,74 +70,38 @@ pub type SharedSchema = Arc<ArcSwap<Schema>>;
 
 /// Request builder for Delta Lake.
 ///
-/// This builder converts batches of Vector events into Parquet-encoded bytes
-/// by first transforming events to Arrow RecordBatch format, then serializing
-/// to Parquet.
+/// This builder converts batches of Vector events directly into Arrow RecordBatches,
+/// avoiding the overhead of serializing to Parquet and deserializing back.
 #[derive(Clone)]
 pub struct DeltaLakeRequestBuilder {
-    /// Encoder that includes the transformer and Arrow batch serializer
-    pub encoder: (Transformer, EncoderKind),
+    /// Transformer for event processing
+    pub transformer: Transformer,
 
     /// Whether to enable automatic schema evolution (infer new fields from events)
     pub schema_evolution: bool,
+
+    /// Whether to make all schema fields nullable
+    pub allow_nullable_fields: bool,
 
     /// Shared schema reference, updated after successful writes by the service
     pub shared_schema: SharedSchema,
 }
 
-impl RequestBuilder<Vec<Event>> for DeltaLakeRequestBuilder {
-    type Metadata = (Arc<Schema>, EventFinalizers);
-    type Events = Vec<Event>;
-    type Encoder = (Transformer, EncoderKind);
-    type Payload = Bytes; // Parquet bytes
-    type Request = DeltaLakeRequest;
-    type Error = io::Error;
-
-    fn compression(&self) -> Compression {
-        // Parquet handles compression internally, so we disable Vector's compression
-        Compression::None
-    }
-
-    fn encoder(&self) -> &Self::Encoder {
-        &self.encoder
-    }
-
-    fn split_input(
-        &self,
-        mut events: Vec<Event>,
-    ) -> (Self::Metadata, RequestMetadataBuilder, Self::Events) {
-        // Extract schema from the Arrow batch encoder
-        let schema = match &self.encoder.1 {
-            EncoderKind::Batch(batch_encoder) => match batch_encoder.serializer() {
-                BatchSerializer::Arrow(arrow_serializer) => Arc::clone(arrow_serializer.schema()),
-            },
-            _ => {
-                panic!("Delta Lake requires batch Arrow encoding");
-            }
-        };
-
+impl DeltaLakeRequestBuilder {
+    /// Build a DeltaLakeRequest from a batch of events.
+    pub fn build_request(&self, mut events: Vec<Event>) -> Result<DeltaLakeRequest, io::Error> {
+        // Extract finalizers before transformation
         let finalizers = events.take_finalizers();
         let metadata_builder = RequestMetadataBuilder::from_events(&events);
 
-        ((schema, finalizers), metadata_builder, events)
-    }
-
-    fn encode_events(
-        &self,
-        events: Self::Events,
-    ) -> Result<EncodeResult<Self::Payload>, Self::Error> {
-        // Transform events using the transformer
+        // Transform events
         let mut transformed_events = Vec::with_capacity(events.len());
-        let mut byte_size = telemetry().create_request_count_byte_size();
-
         for mut event in events {
-            self.encoder.0.transform(&mut event);
-            byte_size.add_event(&event, event.estimated_json_encoded_size_of());
+            self.transformer.transform(&mut event);
             transformed_events.push(event);
         }
 
         // Get base schema from the shared schema reference (updated after successful writes)
-        // ArcSwap provides lock-free reads
         let base_schema: SchemaRef = Arc::clone(&self.shared_schema.load());
 
         // Determine final schema: either base schema or merged with inferred fields
@@ -135,39 +111,29 @@ impl RequestBuilder<Vec<Event>> for DeltaLakeRequestBuilder {
             base_schema
         };
 
-        // Build RecordBatch using existing Arrow infrastructure
+        // Make all fields nullable if configured
+        let schema: SchemaRef = if self.allow_nullable_fields {
+            Arc::new(make_schema_nullable(&schema))
+        } else {
+            schema
+        };
+
+        // Build RecordBatch directly - no Parquet serialization
         let record_batch = build_record_batch(Arc::clone(&schema), &transformed_events)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-        // Serialize RecordBatch to Parquet bytes
-        let mut buffer = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut buffer, Arc::clone(&schema), None)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        // Calculate byte size for metrics (Arrow in-memory size)
+        let byte_size = record_batch.get_array_memory_size();
 
-        writer
-            .write(&record_batch)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        // Build request metadata using the byte size (since we don't have EncodeResult)
+        let request_size = NonZeroUsize::new(byte_size).unwrap_or(NonZeroUsize::MIN);
+        let request_metadata = metadata_builder.with_request_size(request_size);
 
-        writer
-            .close()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        let parquet_bytes = Bytes::from(buffer);
-
-        Ok(EncodeResult::uncompressed(parquet_bytes, byte_size))
-    }
-
-    fn build_request(
-        &self,
-        (schema, finalizers): Self::Metadata,
-        request_metadata: RequestMetadata,
-        payload: EncodeResult<Self::Payload>,
-    ) -> Self::Request {
-        DeltaLakeRequest {
-            parquet_data: payload.into_payload(),
-            schema,
+        Ok(DeltaLakeRequest {
+            batches: vec![record_batch],
             finalizers,
             request_metadata,
-        }
+            byte_size,
+        })
     }
 }

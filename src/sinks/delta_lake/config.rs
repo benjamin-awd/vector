@@ -4,16 +4,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-
 use tower::ServiceBuilder;
 use url::Url;
-use vector_lib::codecs::encoding::{
-    ArrowStreamSerializerConfig, BatchSerializerConfig as BatchSerializerConfigLib, SchemaProvider,
-};
+use vector_lib::codecs::encoding::SchemaProvider;
 use vector_lib::configurable::configurable_component;
 use vector_lib::sink::VectorSink;
 
-use crate::codecs::{BatchEncoder, BatchSerializer, EncoderKind};
 use crate::config::{AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext};
 use crate::sinks::util::{
     BatchConfig, RealtimeSizeBasedDefaultBatchSettings, ServiceBuilderExt, TowerRequestConfig,
@@ -24,6 +20,11 @@ use super::request_builder::{DeltaLakeRequestBuilder, SharedSchema};
 use super::schema::DeltaLakeSchemaProvider;
 use super::service::{DeltaLakeRetryLogic, DeltaLakeService};
 use super::sink::DeltaLakeSink;
+
+/// Default value for allow_nullable_fields - enabled by default for better compatibility
+const fn default_allow_nullable_fields() -> bool {
+    true
+}
 
 /// Configuration for the `delta_lake` sink.
 #[configurable_component(sink(
@@ -64,13 +65,6 @@ pub struct DeltaLakeConfig {
     #[serde(default)]
     pub storage_options: HashMap<String, String>,
 
-    /// Batch encoding configuration.
-    ///
-    /// The schema is automatically fetched from the existing Delta table.
-    #[configurable(derived)]
-    #[serde(default)]
-    pub batch_encoding: ArrowStreamSerializerConfig,
-
     /// Enable automatic schema evolution.
     ///
     /// When enabled, the sink will:
@@ -84,6 +78,15 @@ pub struct DeltaLakeConfig {
     #[configurable(metadata(docs::examples = true))]
     #[serde(default)]
     pub schema_evolution: bool,
+
+    /// Allow nullable fields in the schema.
+    ///
+    /// When enabled, all fields in the schema will be treated as nullable,
+    /// allowing events with missing fields to be written without errors.
+    /// This is useful when incoming events may not contain all fields defined in the table schema.
+    #[configurable(metadata(docs::examples = true))]
+    #[serde(default = "default_allow_nullable_fields")]
+    pub allow_nullable_fields: bool,
 
     /// Batching behavior configuration.
     ///
@@ -112,8 +115,8 @@ impl GenerateConfig for DeltaLakeConfig {
         toml::Value::try_from(Self {
             table_uri: "gs://my-bucket/analytics/events".to_string(),
             storage_options: HashMap::new(),
-            batch_encoding: ArrowStreamSerializerConfig::default(),
             schema_evolution: false,
+            allow_nullable_fields: default_allow_nullable_fields(),
             batch: BatchConfig::default(),
             request: TowerRequestConfig::default(),
             acknowledgements: AcknowledgementsConfig::default(),
@@ -147,27 +150,19 @@ impl SinkConfig for DeltaLakeConfig {
         .await
         .map_err(|e| format!("Failed to open Delta table at {}: {}", self.table_uri, e))?;
 
-        let mut arrow_config = self.batch_encoding.clone();
+        // Get schema from the Delta table
         let schema_provider = DeltaLakeSchemaProvider::new(&table);
         let schema = schema_provider
             .get_schema()
             .await
             .map_err(|e| format!("Failed to fetch schema from Delta table: {}", e))?;
 
-        arrow_config.schema = Some(schema.clone());
-
         let shared_schema: SharedSchema = Arc::new(ArcSwap::from_pointee(schema));
 
-        let batch_config = BatchSerializerConfigLib::ArrowStream(arrow_config);
-        let arrow_serializer = batch_config
-            .build()
-            .map_err(|e| format!("Failed to build Arrow serializer: {}", e))?;
-        let batch_serializer = BatchSerializer::Arrow(arrow_serializer);
-        let encoder = EncoderKind::Batch(BatchEncoder::new(batch_serializer));
-
         let request_builder = DeltaLakeRequestBuilder {
-            encoder: (Transformer::default(), encoder),
+            transformer: Transformer::default(),
             schema_evolution: self.schema_evolution,
+            allow_nullable_fields: self.allow_nullable_fields,
             shared_schema: Arc::clone(&shared_schema),
         };
 
@@ -220,9 +215,6 @@ mod tests {
             [storage_options]
             google_service_account = "/path/to/creds.json"
 
-            [batch_encoding]
-            allow_nullable_fields = true
-
             [batch]
             max_bytes = 104857600
             timeout_secs = 300
@@ -234,7 +226,6 @@ mod tests {
             config.storage_options.get("google_service_account"),
             Some(&"/path/to/creds.json".to_string())
         );
-        assert!(config.batch_encoding.allow_nullable_fields);
     }
 
     #[test]

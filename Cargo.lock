@@ -14050,7 +14050,6 @@ dependencies = [
  "openssl-probe",
  "openssl-src",
  "ordered-float 4.6.0",
- "parquet",
  "paste",
  "percent-encoding",
  "pin-project",
