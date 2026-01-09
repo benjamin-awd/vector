@@ -179,12 +179,11 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                             let cached_version = table_guard.version();
 
                             if new_version > cached_version {
-                                // Update table cache
-                                *table_guard = new_table.clone();
+                                // Get schema before moving new_table to avoid unnecessary clone
+                                let new_schema = new_table.schema();
 
                                 // Log schema evolution if new fields were added
                                 let old_schema = shared_schema.load();
-                                let new_schema = new_table.schema();
                                 let new_fields: Vec<_> = new_schema
                                     .fields()
                                     .iter()
@@ -204,6 +203,9 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                                 // Update schema cache while holding table lock to keep them in sync
                                 // TableProvider::schema() returns the Arrow schema directly
                                 shared_schema.store(new_schema);
+
+                                // Update table cache - move instead of clone
+                                *table_guard = new_table;
                             } else {
                                 debug!(
                                     message =
