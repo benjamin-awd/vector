@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use deltalake::datafusion::datasource::TableProvider;
@@ -6,6 +6,7 @@ use deltalake::operations::write::SchemaMode;
 use deltalake::protocol::SaveMode;
 use deltalake::{DeltaTable, DeltaTableError};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use tokio::sync::RwLock;
 
 use crate::internal_events::EndpointBytesSent;
 use crate::sinks::prelude::*;
@@ -115,9 +116,7 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
         Box::pin(async move {
             // Get a clone of the current table snapshot
             let mut table = {
-                let table_guard = table_lock.read().map_err(|e| {
-                    DeltaTableError::Generic(format!("Failed to acquire table read lock: {}", e))
-                })?;
+                let table_guard = table_lock.read().await;
                 table_guard.clone()
             };
             // Retry loop for handling concurrent transaction conflicts and schema evolution
@@ -174,12 +173,7 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                         // This prevents "race to the bottom" where slower requests could
                         // overwrite newer state with older state
                         {
-                            let mut table_guard = table_lock.write().map_err(|e| {
-                                DeltaTableError::Generic(format!(
-                                    "Failed to acquire table write lock: {}",
-                                    e
-                                ))
-                            })?;
+                            let mut table_guard = table_lock.write().await;
 
                             let new_version = new_table.version();
                             let cached_version = table_guard.version();
