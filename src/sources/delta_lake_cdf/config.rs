@@ -96,6 +96,19 @@ pub struct DeltaLakeCdfConfig {
     #[serde(default)]
     pub ending_version: Option<i64>,
 
+    /// Maximum number of versions to process per poll cycle.
+    ///
+    /// When catching up on a large backlog of versions, processing too many
+    /// versions at once can cause the query planner to hang while listing
+    /// thousands of CDF files. This option limits how many versions are
+    /// processed in each poll cycle, allowing incremental catchup.
+    ///
+    /// If not specified, all available versions are processed at once.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = 100))]
+    #[configurable(metadata(docs::examples = 1000))]
+    pub max_versions_per_poll: Option<i64>,
+
     /// Directory for storing checkpoints.
     ///
     /// The source persists its current position (version) to disk
@@ -177,6 +190,7 @@ impl Default for DeltaLakeCdfConfig {
             include_data: default_include_data(),
             change_types: Vec::new(),
             ending_version: None,
+            max_versions_per_poll: None,
             data_dir: None,
             log_namespace: None,
         }
@@ -214,6 +228,7 @@ impl GenerateConfig for DeltaLakeCdfConfig {
             include_data: default_include_data(),
             change_types: Vec::new(),
             ending_version: None,
+            max_versions_per_poll: None,
             data_dir: None,
             log_namespace: None,
         })
@@ -481,5 +496,26 @@ mod tests {
             Some(ChangeType::Delete)
         );
         assert_eq!(ChangeType::from_cdf_string("unknown"), None);
+    }
+
+    #[test]
+    fn test_config_max_versions_per_poll() {
+        let config_str = r#"
+            table_uri = "s3://bucket/table"
+            max_versions_per_poll = 100
+        "#;
+
+        let config: DeltaLakeCdfConfig = toml::from_str(config_str).expect("Config should parse");
+        assert_eq!(config.max_versions_per_poll, Some(100));
+    }
+
+    #[test]
+    fn test_config_max_versions_per_poll_default() {
+        let config_str = r#"
+            table_uri = "s3://bucket/table"
+        "#;
+
+        let config: DeltaLakeCdfConfig = toml::from_str(config_str).expect("Config should parse");
+        assert_eq!(config.max_versions_per_poll, None);
     }
 }

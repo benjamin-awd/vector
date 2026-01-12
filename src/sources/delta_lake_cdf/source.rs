@@ -104,16 +104,35 @@ pub async fn run_cdf_source(
                 }
 
                 // Determine the end version for this batch
+                // Apply max_versions_per_poll limit to prevent query planner from
+                // hanging when catching up on large backlogs
+                let max_end_from_batch_limit = config
+                    .max_versions_per_poll
+                    .map(|max| current_version.saturating_add(max).saturating_sub(1))
+                    .unwrap_or(i64::MAX);
+
                 let end_version = config
                     .ending_version
                     .map(|e| e.min(latest_version))
-                    .unwrap_or(latest_version);
+                    .unwrap_or(latest_version)
+                    .min(max_end_from_batch_limit);
 
-                debug!(
-                    message = "Processing CDF versions",
-                    start_version = current_version,
-                    end_version = end_version,
-                );
+                // Log at info level when catching up with batching, debug otherwise
+                let versions_behind = latest_version.saturating_sub(end_version);
+                if versions_behind > 0 && config.max_versions_per_poll.is_some() {
+                    info!(
+                        message = "Processing CDF versions (catching up)",
+                        start_version = current_version,
+                        end_version = end_version,
+                        versions_behind = versions_behind,
+                    );
+                } else {
+                    debug!(
+                        message = "Processing CDF versions",
+                        start_version = current_version,
+                        end_version = end_version,
+                    );
+                }
 
                 // Create streaming CDF reader for the version range
                 match create_cdf_stream(&ctx, &table, current_version, end_version).await {
