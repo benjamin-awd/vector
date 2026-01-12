@@ -4,6 +4,7 @@ use deltalake::DeltaTable;
 use deltalake::DeltaTableError;
 use deltalake::datafusion::prelude::SessionContext;
 use deltalake::delta_datafusion::DeltaCdfTableProvider;
+use futures::StreamExt;
 use std::sync::Arc;
 use tokio::time::interval;
 use vector_lib::EstimatedJsonEncodedSizeOf;
@@ -114,60 +115,99 @@ pub async fn run_cdf_source(
                     end_version = end_version,
                 );
 
-                // Load CDF data for the version range
-                match load_cdf_data(&ctx, &table, current_version, end_version).await {
-                    Ok(batches) => {
-                        if batches.is_empty() {
-                            debug!(message = "No CDF data in version range");
-                            current_version = end_version + 1;
-                            continue;
-                        }
+                // Create streaming CDF reader for the version range
+                match create_cdf_stream(&ctx, &table, current_version, end_version).await {
+                    Ok(mut stream) => {
+                        let mut total_events: usize = 0;
+                        let mut stream_error = false;
 
-                        // Calculate byte size for metrics
-                        let byte_size: usize = batches.iter()
-                            .map(|b| b.get_array_memory_size())
-                            .sum();
-                        bytes_received.emit(ByteSize(byte_size));
+                        // Process batches as they arrive - no memory accumulation
+                        while let Some(batch_result) = stream.next().await {
+                            match batch_result {
+                                Ok(batch) => {
+                                    if batch.num_rows() == 0 {
+                                        continue;
+                                    }
 
-                        // Convert to Vector events
-                        match convert_cdf_batches_to_events(batches, &config, log_namespace) {
-                            Ok(events) => {
-                                if events.is_empty() {
-                                    debug!(message = "All events filtered out");
-                                    current_version = end_version + 1;
-                                    continue;
+                                    // Emit byte metrics for this batch
+                                    let byte_size = batch.get_array_memory_size();
+                                    bytes_received.emit(ByteSize(byte_size));
+
+                                    // Convert batch to events
+                                    match convert_cdf_batches_to_events(vec![batch], &config, log_namespace) {
+                                        Ok(events) => {
+                                            if events.is_empty() {
+                                                continue;
+                                            }
+
+                                            let event_count = events.len();
+                                            let json_size = events.estimated_json_encoded_size_of();
+                                            events_received.emit(CountByteSize(event_count, json_size));
+
+                                            // Send events downstream immediately
+                                            if out.send_batch(events).await.is_err() {
+                                                emit!(StreamClosedError { count: event_count });
+                                                return Err(());
+                                            }
+
+                                            total_events += event_count;
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                message = "Failed to convert CDF batch to events",
+                                                error = %e,
+                                            );
+                                            stream_error = true;
+                                            break;
+                                        }
+                                    }
                                 }
+                                Err(e) => {
+                                    // Check if this is a "file not found" error
+                                    if is_file_not_found_error(&e) {
+                                        let new_version = latest_version + 1;
+                                        warn!(
+                                            message = "CDF data files not found during stream (likely removed by VACUUM), skipping to latest",
+                                            error = %e,
+                                            old_version = current_version,
+                                            new_version = new_version,
+                                        );
+                                        current_version = new_version;
+                                        if let Err(e) = checkpointer.write_checkpoint(current_version) {
+                                            error!(message = "Failed to save checkpoint", error = %e);
+                                        }
+                                        stream_error = true;
+                                        break;
+                                    }
 
-                                let event_count = events.len();
-                                let json_size = events.estimated_json_encoded_size_of();
-                                events_received.emit(CountByteSize(event_count, json_size));
-
-                                // Send events downstream
-                                if out.send_batch(events).await.is_err() {
-                                    emit!(StreamClosedError { count: event_count });
-                                    return Err(());
-                                }
-
-                                debug!(
-                                    message = "Sent CDF events",
-                                    count = event_count,
-                                    versions = format!("{}..{}", current_version, end_version),
-                                );
-
-                                // Update checkpoint
-                                current_version = end_version + 1;
-                                if let Err(e) = checkpointer.write_checkpoint(current_version) {
                                     error!(
-                                        message = "Failed to save checkpoint",
+                                        message = "Error reading CDF stream",
                                         error = %e,
-                                        version = current_version,
                                     );
+                                    stream_error = true;
+                                    break;
                                 }
                             }
-                            Err(e) => {
+                        }
+
+                        // Only update checkpoint if stream completed successfully
+                        if !stream_error {
+                            if total_events > 0 {
+                                debug!(
+                                    message = "Sent CDF events",
+                                    count = total_events,
+                                    versions = format!("{}..{}", current_version, end_version),
+                                );
+                            } else {
+                                debug!(message = "No CDF data in version range");
+                            }
+
+                            current_version = end_version + 1;
+                            if let Err(e) = checkpointer.write_checkpoint(current_version) {
                                 error!(
-                                    message = "Failed to convert CDF data to events",
+                                    message = "Failed to save checkpoint",
                                     error = %e,
+                                    version = current_version,
                                 );
                             }
                         }
@@ -236,13 +276,16 @@ pub async fn run_cdf_source(
     }
 }
 
-/// Load Change Data Feed data from Delta table.
-async fn load_cdf_data(
+/// Create a streaming CDF reader for a version range.
+///
+/// Returns a stream of RecordBatches instead of collecting all data into memory.
+/// This allows processing large version ranges incrementally without OOM risk.
+async fn create_cdf_stream(
     ctx: &SessionContext,
     table: &DeltaTable,
     start_version: i64,
     end_version: i64,
-) -> Result<Vec<deltalake::arrow::record_batch::RecordBatch>, DeltaTableError> {
+) -> Result<impl futures::Stream<Item = Result<deltalake::arrow::record_batch::RecordBatch, DeltaTableError>>, DeltaTableError> {
     // Clone table and create CDF builder
     let cdf_builder = table
         .clone()
@@ -253,11 +296,14 @@ async fn load_cdf_data(
     // Create CDF table provider
     let cdf_provider = DeltaCdfTableProvider::try_new(cdf_builder)?;
 
-    // Execute the CDF scan using DataFusion
+    // Execute the CDF scan using DataFusion and return as stream
     let df = ctx.read_table(Arc::new(cdf_provider))?;
-    let batches = df.collect().await?;
+    let stream = df.execute_stream().await?;
 
-    Ok(batches)
+    // Map the DataFusion error type to DeltaTableError
+    Ok(stream.map(|result| {
+        result.map_err(|e| DeltaTableError::Generic(format!("DataFusion stream error: {}", e)))
+    }))
 }
 
 /// Check if an error indicates that files were not found (likely deleted by VACUUM).
