@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use deltalake::DeltaTableError;
+use deltalake::checkpoints::create_checkpoint;
 use deltalake::datafusion::datasource::TableProvider;
 use deltalake::operations::write::SchemaMode;
 use deltalake::protocol::SaveMode;
@@ -12,6 +13,11 @@ use crate::internal_events::EndpointBytesSent;
 use crate::sinks::prelude::*;
 
 use super::request_builder::{DeltaLakeRequest, SharedSchema};
+
+/// Checkpoint interval - create a checkpoint every N commits.
+/// Checkpoints consolidate the transaction log into a single parquet file,
+/// dramatically improving read performance for tables with many versions.
+const CHECKPOINT_INTERVAL: i64 = 10;
 
 /// Response from Delta Lake write operations.
 ///
@@ -201,6 +207,30 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                                 version = new_table.version(),
                             );
                             shared_schema.store(new_schema);
+                        }
+
+                        // Create checkpoint if we've hit the interval.
+                        // Checkpoints consolidate the transaction log into a single parquet file,
+                        // which dramatically reduces memory usage when opening the table.
+                        if let Some(version) = new_table.version() {
+                            if version % CHECKPOINT_INTERVAL == 0 {
+                                match create_checkpoint(&new_table, None).await {
+                                    Ok(()) => {
+                                        info!(
+                                            message = "Created checkpoint",
+                                            version = version,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        // Log but don't fail the write - checkpoint is best-effort
+                                        warn!(
+                                            message = "Failed to create checkpoint",
+                                            version = version,
+                                            error = %e,
+                                        );
+                                    }
+                                }
+                            }
                         }
 
                         // Get the byte size from the request (Arrow in-memory size)
