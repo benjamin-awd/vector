@@ -304,7 +304,10 @@ async fn create_cdf_stream(
     table: &DeltaTable,
     start_version: i64,
     end_version: i64,
-) -> Result<impl futures::Stream<Item = Result<deltalake::arrow::record_batch::RecordBatch, DeltaTableError>>, DeltaTableError> {
+) -> Result<
+    impl futures::Stream<Item = Result<deltalake::arrow::record_batch::RecordBatch, DeltaTableError>>,
+    DeltaTableError,
+> {
     // Clone table and create CDF builder
     let cdf_builder = table
         .clone()

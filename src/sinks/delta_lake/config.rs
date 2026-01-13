@@ -166,7 +166,12 @@ impl SinkConfig for DeltaLakeConfig {
             shared_schema: Arc::clone(&shared_schema),
         };
 
-        let service = DeltaLakeService::new(table.clone(), self.schema_evolution, shared_schema);
+        let service = DeltaLakeService::new(
+            self.table_uri.clone(),
+            self.storage_options.clone(),
+            self.schema_evolution,
+            shared_schema,
+        );
         let service = ServiceBuilder::new()
             .settings(self.request.into_settings(), DeltaLakeRetryLogic)
             .service(service);

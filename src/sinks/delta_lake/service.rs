@@ -1,11 +1,12 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use deltalake::DeltaTableError;
 use deltalake::datafusion::datasource::TableProvider;
 use deltalake::operations::write::SchemaMode;
 use deltalake::protocol::SaveMode;
-use deltalake::{DeltaTable, DeltaTableError};
-use tokio::sync::RwLock;
+use url::Url;
 
 use crate::internal_events::EndpointBytesSent;
 use crate::sinks::prelude::*;
@@ -47,8 +48,9 @@ impl DriverResponse for DeltaLakeResponse {
 /// This service writes Arrow RecordBatches directly to Delta Lake tables,
 /// avoiding the overhead of Parquet serialization/deserialization round-trips.
 ///
-/// The table is wrapped in RwLock to allow updating the cached snapshot after
-/// successful commits, reducing unnecessary conflict retries.
+/// Opens a fresh table connection for each write request to ensure bounded memory
+/// usage. This prevents accumulation of transaction log state that can cause OOM
+/// issues with tables that have many versions.
 ///
 /// ## Schema Evolution Support
 ///
@@ -58,7 +60,10 @@ impl DriverResponse for DeltaLakeResponse {
 /// 2. Retry the write operation with schema merge enabled
 #[derive(Clone)]
 pub struct DeltaLakeService {
-    table: Arc<RwLock<DeltaTable>>,
+    /// Table URI for opening fresh connections
+    table_uri: String,
+    /// Storage options for authentication
+    storage_options: HashMap<String, String>,
     schema_evolution: bool,
     /// Shared schema reference, updated after successful writes
     shared_schema: SharedSchema,
@@ -66,9 +71,15 @@ pub struct DeltaLakeService {
 
 impl DeltaLakeService {
     /// Create a new Delta Lake service for the given table.
-    pub fn new(table: DeltaTable, schema_evolution: bool, shared_schema: SharedSchema) -> Self {
+    pub const fn new(
+        table_uri: String,
+        storage_options: HashMap<String, String>,
+        schema_evolution: bool,
+        shared_schema: SharedSchema,
+    ) -> Self {
         Self {
-            table: Arc::new(RwLock::new(table)),
+            table_uri,
+            storage_options,
             schema_evolution,
             shared_schema,
         }
@@ -107,7 +118,8 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
     }
 
     fn call(&mut self, request: DeltaLakeRequest) -> Self::Future {
-        let table_lock = Arc::clone(&self.table);
+        let table_uri = self.table_uri.clone();
+        let storage_options = self.storage_options.clone();
         let schema_evolution = self.schema_evolution;
         let shared_schema = Arc::clone(&self.shared_schema);
 
@@ -115,11 +127,23 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
             // Use batches directly from request - no Parquet deserialization needed
             let batches = request.batches;
 
-            // Get a clone of the current table snapshot
-            let mut table = {
-                let table_guard = table_lock.read().await;
-                table_guard.clone()
-            };
+            // Open a fresh table connection for each request to ensure bounded memory.
+            // This prevents accumulation of transaction log state that can cause OOM
+            // issues with tables that have many versions (e.g., 20k+ versions).
+            // The table is dropped at the end of each request, freeing all memory.
+            let parsed_uri = Url::parse(&table_uri).map_err(|e| {
+                DeltaTableError::Generic(format!("Invalid table URI {}: {}", table_uri, e))
+            })?;
+
+            let mut table =
+                deltalake::open_table_with_storage_options(parsed_uri, storage_options.clone())
+                    .await
+                    .map_err(|e| {
+                        DeltaTableError::Generic(format!(
+                            "Failed to open table {}: {}",
+                            table_uri, e
+                        ))
+                    })?;
 
             // Retry loop for handling concurrent transaction conflicts and schema evolution
             // When optimization operations (like z-order) rewrite files, or when schema changes,
@@ -155,52 +179,28 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                 // Execute write and commit
                 match write_builder.await {
                     Ok(new_table) => {
-                        // Success! Update the cached table to the latest version
-                        // Only update if our committed version is newer than the cached version
-                        // This prevents "race to the bottom" where slower requests could
-                        // overwrite newer state with older state
-                        {
-                            let mut table_guard = table_lock.write().await;
+                        // Update schema cache for request builder (used for schema evolution)
+                        // We don't cache the full table state since we reload before each write,
+                        // which bounds memory usage by not accumulating transaction log state.
+                        let new_schema = new_table.schema();
+                        let old_schema = shared_schema.load();
 
-                            let new_version = new_table.version();
-                            let cached_version = table_guard.version();
+                        // Log and update schema if new fields were added
+                        let new_fields: Vec<_> = new_schema
+                            .fields()
+                            .iter()
+                            .filter(|f| old_schema.field_with_name(f.name()).is_err())
+                            .map(|f| f.name().as_str())
+                            .collect();
 
-                            if new_version > cached_version {
-                                // Get schema before moving new_table to avoid unnecessary clone
-                                let new_schema = new_table.schema();
-
-                                // Log schema evolution if new fields were added
-                                let old_schema = shared_schema.load();
-                                let new_fields: Vec<_> = new_schema
-                                    .fields()
-                                    .iter()
-                                    .filter(|f| old_schema.field_with_name(f.name()).is_err())
-                                    .map(|f| f.name().as_str())
-                                    .collect();
-
-                                if !new_fields.is_empty() {
-                                    info!(
-                                        message = "Schema evolution: new fields added to table",
-                                        new_fields = ?new_fields,
-                                        total_fields = new_schema.fields().len(),
-                                        version = new_version,
-                                    );
-                                }
-
-                                // Update schema cache while holding table lock to keep them in sync
-                                // TableProvider::schema() returns the Arrow schema directly
-                                shared_schema.store(new_schema);
-
-                                // Update table cache - move instead of clone
-                                *table_guard = new_table;
-                            } else {
-                                debug!(
-                                    message =
-                                        "Skipping cache update - cached version is newer or equal",
-                                    new_version = new_version,
-                                    cached_version = cached_version,
-                                );
-                            }
+                        if !new_fields.is_empty() {
+                            info!(
+                                message = "Schema evolution: new fields added to table",
+                                new_fields = ?new_fields,
+                                total_fields = new_schema.fields().len(),
+                                version = new_table.version(),
+                            );
+                            shared_schema.store(new_schema);
                         }
 
                         // Get the byte size from the request (Arrow in-memory size)
