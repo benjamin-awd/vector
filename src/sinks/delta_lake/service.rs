@@ -6,13 +6,8 @@ use std::time::Duration;
 use deltalake::DeltaTableError;
 use deltalake::datafusion::datasource::TableProvider;
 use deltalake::operations::write::SchemaMode;
-use deltalake::protocol::checkpoints::create_checkpoint;
 use deltalake::protocol::SaveMode;
 use url::Url;
-
-/// Interval at which to create checkpoints (every N versions).
-/// Checkpoints compact the transaction log, reducing memory usage on subsequent reads.
-const CHECKPOINT_INTERVAL: i64 = 10;
 
 use crate::common::backoff::ExponentialBackoff;
 use crate::internal_events::EndpointBytesSent;
@@ -210,34 +205,6 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                                 version = new_table.version(),
                             );
                             shared_schema.store(new_schema);
-                        }
-
-                        // Create checkpoint at regular intervals to compact the transaction log.
-                        // This reduces memory usage on subsequent table loads by allowing readers
-                        // to start from the checkpoint instead of reading the full log.
-                        if let Some(version) = new_table.version() {
-                            if version > 0 && version % CHECKPOINT_INTERVAL == 0 {
-                                info!(
-                                    message = "Creating checkpoint for Delta table",
-                                    version = version,
-                                );
-                                match create_checkpoint(&new_table, None).await {
-                                    Ok(()) => {
-                                        info!(
-                                            message = "Successfully created checkpoint",
-                                            version = version,
-                                        );
-                                    }
-                                    Err(e) => {
-                                        // Log but don't fail the write - checkpointing is best-effort
-                                        warn!(
-                                            message = "Failed to create checkpoint, will retry on next interval",
-                                            version = version,
-                                            error = %e,
-                                        );
-                                    }
-                                }
-                            }
                         }
 
                         // Get the byte size from the request (Arrow in-memory size)
