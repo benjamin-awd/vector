@@ -232,6 +232,12 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                         //    GCS returns FAILED_PRECONDITION when conditional write (if-generation-match)
                         //    fails because another writer committed the same version first.
                         let error_str = e.to_string();
+                        let error_lower = error_str.to_lowercase();
+                        // Detect concurrent conflicts from various sources:
+                        // 1. Delta transaction conflicts (ConcurrentDeleteRead from optimize/vacuum)
+                        // 2. GCS FAILED_PRECONDITION (HTTP 412) from conditional writes
+                        //    GCS returns 412 when if-generation-match fails because another
+                        //    writer committed the same version first.
                         let is_concurrent_conflict = matches!(
                             &e,
                             DeltaTableError::Transaction { source }
@@ -240,9 +246,9 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                         ) || matches!(
                             &e,
                             DeltaTableError::ObjectStore { .. }
-                                if error_str.contains("FAILED_PRECONDITION")
-                                    || error_str.contains("precondition")
-                                    || error_str.contains("Precondition")
+                                if error_lower.contains("failed_precondition")
+                                    || error_lower.contains("precondition")
+                                    || error_str.contains("412")
                         );
 
                         let is_schema_mismatch = Self::is_schema_mismatch_error(&e);
@@ -328,8 +334,60 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
 /// Retry logic for Delta Lake operations.
 ///
 /// Determines which errors are retriable (network/storage) vs non-retriable (schema/data).
+/// Mirrors the GCS sink's retry logic for HTTP status codes that appear in object_store errors.
 #[derive(Debug, Clone, Default)]
 pub struct DeltaLakeRetryLogic;
+
+impl DeltaLakeRetryLogic {
+    /// Check if an error string indicates a non-retriable GCS HTTP error.
+    ///
+    /// Most GCS errors should be retried (network issues, rate limits, server errors).
+    /// Only permanent client errors should NOT be retried:
+    /// - 400 Bad Request: Malformed request
+    /// - 403 Forbidden: Permission denied (won't change on retry)
+    /// - 404 Not Found: Resource doesn't exist
+    /// - 405 Method Not Allowed: Wrong HTTP method
+    /// - 409 Conflict: (Note: FAILED_PRECONDITION is handled separately)
+    /// - 410 Gone: Resource permanently deleted
+    fn is_non_retriable_gcs_error(error_str: &str) -> bool {
+        let error_lower = error_str.to_lowercase();
+
+        // 400 Bad Request - malformed request won't succeed on retry
+        if error_lower.contains("400") && error_lower.contains("bad request") {
+            return true;
+        }
+
+        // 403 Forbidden - permission issues won't resolve on retry
+        if error_lower.contains("403") || error_lower.contains("forbidden") {
+            return true;
+        }
+
+        // 404 Not Found - resource doesn't exist
+        if error_lower.contains("404") || error_lower.contains("not found") {
+            return true;
+        }
+
+        // 405 Method Not Allowed
+        if error_lower.contains("405") || error_lower.contains("method not allowed") {
+            return true;
+        }
+
+        // 410 Gone - resource permanently deleted
+        if error_lower.contains("410") || error_lower.contains("gone") {
+            return true;
+        }
+
+        // Permission denied patterns
+        if error_lower.contains("permission denied")
+            || error_lower.contains("access denied")
+            || error_lower.contains("not authorized")
+        {
+            return true;
+        }
+
+        false
+    }
+}
 
 impl RetryLogic for DeltaLakeRetryLogic {
     type Error = DeltaTableError;
@@ -350,8 +408,11 @@ impl RetryLogic for DeltaLakeRetryLogic {
         }
 
         match error {
-            // Retry on storage/network errors (but not precondition failures, checked above)
-            DeltaTableError::ObjectStore { source: _ } => true,
+            // Retry on storage/network errors unless it's a non-retriable client error
+            // (FAILED_PRECONDITION is already excluded above)
+            DeltaTableError::ObjectStore { source: _ } => {
+                !Self::is_non_retriable_gcs_error(&error_str)
+            }
             DeltaTableError::Io { source: _ } => true,
 
             // Don't retry schema/data errors
@@ -359,8 +420,8 @@ impl RetryLogic for DeltaLakeRetryLogic {
             DeltaTableError::Kernel { source: _ } => false,
             DeltaTableError::InvalidData { violations: _ } => false,
 
-            // Generic errors - be conservative, don't retry
-            _ => false,
+            // Generic errors - retry unless it's a non-retriable GCS pattern
+            _ => !Self::is_non_retriable_gcs_error(&error_str),
         }
     }
 }

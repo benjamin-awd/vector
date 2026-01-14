@@ -61,6 +61,11 @@ pub struct DeltaLakeConfig {
     /// - `aws_allow_http`: Allow HTTP connections (for local testing)
     /// - `aws_s3_path_style`: Use path-style addressing (for MinIO)
     ///
+    /// **Client options (all backends):**
+    /// - `timeout`: Request timeout (e.g., "30s")
+    /// - `connect_timeout`: Connection establishment timeout (e.g., "5s")
+    /// - `pool_idle_timeout`: Keep-alive timeout for idle connections (e.g., "90s")
+    ///
     /// If not provided, the sink will use default credentials from the environment.
     #[serde(default)]
     pub storage_options: HashMap<String, String>,
