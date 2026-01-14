@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use deltalake::DeltaTableError;
 use deltalake::datafusion::datasource::TableProvider;
@@ -13,6 +14,7 @@ use url::Url;
 /// Checkpoints compact the transaction log, reducing memory usage on subsequent reads.
 const CHECKPOINT_INTERVAL: i64 = 10;
 
+use crate::common::backoff::ExponentialBackoff;
 use crate::internal_events::EndpointBytesSent;
 use crate::sinks::prelude::*;
 
@@ -153,10 +155,12 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
             // Retry loop for handling concurrent transaction conflicts and schema evolution
             // When optimization operations (like z-order) rewrite files, or when schema changes,
             // we need to reload the table snapshot and retry the write
-            const MAX_CONFLICT_RETRIES: usize = 3;
+            const MAX_CONFLICT_RETRIES: usize = 5;
             const MAX_SCHEMA_RETRIES: usize = 1;
             let mut conflict_retry_count = 0;
             let mut schema_retry_count = 0;
+            // Exponential backoff for conflict retries to reduce thundering herd effect
+            let mut backoff = ExponentialBackoff::default().max_delay(Duration::from_secs(30));
 
             loop {
                 // Log retry attempt for schema evolution
@@ -308,11 +312,17 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                         // Handle concurrent transaction conflicts
                         if is_concurrent_conflict && conflict_retry_count < MAX_CONFLICT_RETRIES {
                             conflict_retry_count += 1;
+
+                            // Apply exponential backoff before retry to reduce thundering herd
+                            let backoff_duration =
+                                backoff.next().unwrap_or(Duration::from_secs(30));
                             warn!(
-                                message = "Concurrent table modification detected, reloading and retrying",
+                                message = "Concurrent table modification detected, backing off then reloading",
                                 retry_count = conflict_retry_count,
                                 max_retries = MAX_CONFLICT_RETRIES,
+                                backoff_ms = backoff_duration.as_millis(),
                             );
+                            tokio::time::sleep(backoff_duration).await;
 
                             // Reload the table to get the latest snapshot
                             // This picks up changes from optimize/vacuum operations
