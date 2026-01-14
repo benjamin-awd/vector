@@ -255,11 +255,23 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                     }
                     Err(e) => {
                         // Check error type for appropriate retry strategy
+                        // Concurrent conflicts can manifest as:
+                        // 1. Transaction errors with ConcurrentDeleteRead (from optimize/vacuum)
+                        // 2. ObjectStore errors with FAILED_PRECONDITION (from concurrent writes)
+                        //    GCS returns FAILED_PRECONDITION when conditional write (if-generation-match)
+                        //    fails because another writer committed the same version first.
+                        let error_str = e.to_string();
                         let is_concurrent_conflict = matches!(
                             &e,
                             DeltaTableError::Transaction { source }
                                 if source.to_string().contains("ConcurrentDeleteRead")
                                     || source.to_string().contains("concurrent transaction deleted")
+                        ) || matches!(
+                            &e,
+                            DeltaTableError::ObjectStore { .. }
+                                if error_str.contains("FAILED_PRECONDITION")
+                                    || error_str.contains("precondition")
+                                    || error_str.contains("Precondition")
                         );
 
                         let is_schema_mismatch = Self::is_schema_mismatch_error(&e);
@@ -348,8 +360,20 @@ impl RetryLogic for DeltaLakeRetryLogic {
     type Response = DeltaLakeResponse;
 
     fn is_retriable_error(&self, error: &Self::Error) -> bool {
+        let error_str = error.to_string();
+
+        // Don't retry FAILED_PRECONDITION at Tower level - these are concurrent write
+        // conflicts that are handled internally with table reload. Retrying here without
+        // reload would cause infinite loops with stale version numbers.
+        if error_str.contains("FAILED_PRECONDITION")
+            || error_str.contains("precondition")
+            || error_str.contains("Precondition")
+        {
+            return false;
+        }
+
         match error {
-            // Retry on storage/network errors
+            // Retry on storage/network errors (but not precondition failures, checked above)
             DeltaTableError::ObjectStore { source: _ } => true,
             DeltaTableError::Io { source: _ } => true,
 
