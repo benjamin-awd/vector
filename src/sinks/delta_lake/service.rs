@@ -253,6 +253,17 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
 
                         let is_schema_mismatch = Self::is_schema_mismatch_error(&e);
 
+                        // Log error classification for debugging retry behavior
+                        warn!(
+                            message = "Delta Lake write error occurred",
+                            error = %e,
+                            error_debug = ?e,
+                            is_concurrent_conflict = is_concurrent_conflict,
+                            is_schema_mismatch = is_schema_mismatch,
+                            conflict_retry_count = conflict_retry_count,
+                            schema_retry_count = schema_retry_count,
+                        );
+
                         // Handle schema mismatch errors with reload and retry (if enabled)
                         if schema_evolution
                             && is_schema_mismatch
@@ -320,7 +331,14 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                         } else if is_concurrent_conflict {
                             error!(
                                 message = "Exhausted retries for concurrent conflict",
+                                error = %e,
                                 retry_count = conflict_retry_count,
+                            );
+                        } else {
+                            error!(
+                                message = "Non-retriable Delta Lake error, not classified as conflict or schema mismatch",
+                                error = %e,
+                                error_debug = ?e,
                             );
                         }
                         return Err(e);
