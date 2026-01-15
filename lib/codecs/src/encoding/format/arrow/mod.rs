@@ -20,7 +20,7 @@ use snafu::Snafu;
 use std::sync::Arc;
 use vector_config::configurable_component;
 
-use builder::build_record_batch;
+pub use builder::build_record_batch;
 
 /// Provides Arrow schema for encoding.
 ///
@@ -122,6 +122,11 @@ impl ArrowStreamSerializer {
         Ok(Self {
             schema: SchemaRef::new(schema),
         })
+    }
+
+    /// Get a reference to the Arrow schema used by this serializer
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
     }
 }
 
@@ -234,8 +239,11 @@ pub fn encode_events_to_arrow_ipc_stream(
     Ok(buffer.into_inner().freeze())
 }
 
-/// Recursively makes a Field and all its nested fields nullable
-fn make_field_nullable(field: &arrow::datatypes::Field) -> arrow::datatypes::Field {
+/// Recursively makes a Field and all its nested fields nullable.
+///
+/// This is useful for schema evolution scenarios where new fields need to be nullable,
+/// or when events may have missing fields that should be represented as null.
+pub fn make_field_nullable(field: &arrow::datatypes::Field) -> arrow::datatypes::Field {
     let new_data_type = match field.data_type() {
         DataType::List(inner_field) => DataType::List(make_field_nullable(inner_field).into()),
         DataType::Struct(fields) => {

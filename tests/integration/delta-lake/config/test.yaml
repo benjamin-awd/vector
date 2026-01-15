@@ -1,0 +1,24 @@
+# Test configuration for Delta Lake sink integration tests with MinIO
+
+features:
+- delta-lake-integration-tests
+
+test_filter: '::delta_lake::integration_tests::'
+
+runner:
+  env:
+    MINIO_ENDPOINT: http://minio:9000
+    AWS_ACCESS_KEY_ID: minioadmin
+    AWS_SECRET_ACCESS_KEY: minioadmin
+    AWS_REGION: us-east-1
+    AWS_ALLOW_HTTP: "true"
+
+matrix:
+  version: ['latest']
+
+# Changes to these files/paths will invoke the integration test in CI
+# Expressions are evaluated using https://github.com/micromatch/picomatch
+paths:
+- "src/sinks/delta_lake/**"
+- "lib/codecs/src/encoding/format/arrow/**"
+- "tests/integration/delta-lake/**"

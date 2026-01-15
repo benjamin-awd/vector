@@ -270,7 +270,7 @@ aws-types = { version = "1.3.8", default-features = false, optional = true }
 # The sts crate is needed despite not being referred to anywhere in the code because we need to set the
 # `behavior-version-latest` feature. Without this we get a runtime panic when `auth.assume_role` authentication
 # is configured.
-aws-sdk-sts = { version = "1.73.0", default-features = false, features = ["behavior-version-latest", "rt-tokio"], optional = true }
+aws-sdk-sts = { version = "1.95.0", default-features = false, features = ["behavior-version-latest", "rt-tokio"], optional = true }
 
 # The `aws-sdk-sts` crate is needed despite not being referred to anywhere in the code because we need to set the
 # `behavior-version-latest` feature. Without this we get a runtime panic when `auth.assume_role` authentication is configured.
@@ -296,6 +296,9 @@ azure_core_for_storage = { package = "azure_core", version = "0.21.0", default-f
 
 # OpenDAL
 opendal = { version = "0.54", default-features = false, features = ["services-webhdfs"], optional = true }
+
+# Delta Lake
+deltalake = { version = "0.30.0", default-features = false, features = ["datafusion", "gcs", "s3", "rustls"], optional = true }
 
 # Tower
 tower = { version = "0.5.2", default-features = false, features = ["buffer", "limit", "retry", "timeout", "util", "balance", "discover"] }
@@ -338,10 +341,13 @@ greptimedb-ingester = { git = "https://github.com/GreptimeTeam/greptimedb-ingest
 
 # External libs
 arc-swap = { version = "1.7", default-features = false, optional = true }
-async-compression = { version = "0.4.27", default-features = false, features = ["tokio", "gzip", "zstd"], optional = true }
+# Pinned to 0.4.19 to use xz2 instead of liblzma (avoids conflict with datafusion's xz2)
+# See: https://github.com/apache/datafusion/issues/15342
+async-compression = { version = "=0.4.19", default-features = false, features = ["tokio", "gzip", "zstd"], optional = true }
 apache-avro = { version = "0.16.0", default-features = false, optional = true }
-arrow = { version = "56.2.0", default-features = false, features = ["ipc"], optional = true }
-arrow-schema = { version = "56.2.0", default-features = false, optional = true }
+# Updated to 57.1.0 for compatibility with deltalake 0.30.0
+arrow = { version = "57.1.0", default-features = false, features = ["ipc"], optional = true }
+arrow-schema = { version = "57.1.0", default-features = false, optional = true }
 axum = { version = "0.6.20", default-features = false }
 base64 = { workspace = true, optional = true }
 bloomy = { version = "1.2.0", default-features = false, optional = true }
@@ -493,7 +499,6 @@ nix = { git = "https://github.com/vectordotdev/nix.git", branch = "memfd/gnu/mus
 # The `heim` crates depend on `ntapi` 0.3.7 on Windows, but that version has an
 # unaligned access bug fixed in the following revision.
 ntapi = { git = "https://github.com/MSxDOS/ntapi.git", rev = "24fc1e47677fc9f6e38e5f154e6011dc9b270da6" }
-
 [features]
 # Default features for *-unknown-linux-gnu and *-apple-darwin
 default = ["api", "api-client", "enrichment-tables", "sinks", "sources", "sources-dnstap", "transforms", "unix", "rdkafka?/gssapi-vendored", "secrets"]
@@ -601,6 +606,7 @@ sources-logs = [
   "sources-aws_s3",
   "sources-aws_sqs",
   "sources-datadog_agent",
+  "sources-delta_lake_cdf",
   "sources-demo_logs",
   "sources-docker_logs",
   "sources-exec",
@@ -653,6 +659,7 @@ sources-aws_kinesis_firehose = ["dep:base64"]
 sources-aws_s3 = ["aws-core", "dep:aws-sdk-sqs", "dep:aws-sdk-s3", "dep:async-compression", "sources-aws_sqs", "tokio-util/io"]
 sources-aws_sqs = ["aws-core", "dep:aws-sdk-sqs"]
 sources-datadog_agent = ["sources-utils-http-encoding", "protobuf-build", "dep:prost"]
+sources-delta_lake_cdf = ["dep:deltalake", "codecs-arrow"]
 sources-demo_logs = ["dep:fakedata"]
 sources-dnstap = ["sources-utils-net-tcp", "dep:base64", "dep:hickory-proto", "dep:dnsmsg-parser", "dep:dnstap-parser", "protobuf-build", "dep:prost"]
 sources-docker_logs = ["docker"]
@@ -789,6 +796,7 @@ sinks-logs = [
   "sinks-clickhouse",
   "sinks-console",
   "sinks-databend",
+  "sinks-delta_lake",
   "sinks-datadog_events",
   "sinks-datadog_logs",
   "sinks-datadog_traces",
@@ -855,6 +863,7 @@ sinks-chronicle = []
 sinks-clickhouse = ["dep:rust_decimal", "codecs-arrow"]
 sinks-console = []
 sinks-databend = ["dep:databend-client"]
+sinks-delta_lake = ["dep:deltalake", "codecs-arrow", "dep:opendal", "dep:arc-swap"]
 sinks-datadog_events = []
 sinks-datadog_logs = []
 sinks-datadog_metrics = ["protobuf-build", "dep:prost", "dep:prost-reflect"]
@@ -906,6 +915,7 @@ all-integration-tests = [
   "chronicle-integration-tests",
   "clickhouse-integration-tests",
   "databend-integration-tests",
+  "delta-lake-integration-tests",
   "datadog-agent-integration-tests",
   "datadog-logs-integration-tests",
   "datadog-metrics-integration-tests",
@@ -972,6 +982,8 @@ azure-blob-integration-tests = ["sinks-azure_blob"]
 chronicle-integration-tests = ["sinks-gcp"]
 clickhouse-integration-tests = ["sinks-clickhouse"]
 databend-integration-tests = ["sinks-databend"]
+delta-lake-integration-tests = ["sinks-delta_lake", "dep:deltalake"]
+delta-lake-cdf-integration-tests = ["sources-delta_lake_cdf", "dep:deltalake"]
 datadog-agent-integration-tests = ["sources-datadog_agent"]
 datadog-logs-integration-tests = ["sinks-datadog_logs"]
 datadog-metrics-integration-tests = ["sinks-datadog_metrics", "dep:prost"]
