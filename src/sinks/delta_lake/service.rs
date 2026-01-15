@@ -266,34 +266,41 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
 
                 match write_builder.await {
                     Ok(new_table) => {
-                        // Update schema cache for request builder (used for schema evolution)
-                        let new_schema = new_table.schema();
-                        let old_schema = shared_schema.load();
-
-                        // Log and update schema if new fields were added
-                        let new_fields: Vec<_> = new_schema
-                            .fields()
-                            .iter()
-                            .filter(|f| old_schema.field_with_name(f.name()).is_err())
-                            .map(|f| f.name().as_str())
-                            .collect();
-
-                        if !new_fields.is_empty() {
-                            info!(
-                                message = "Schema evolution: new fields added to table",
-                                new_fields = ?new_fields,
-                                total_fields = new_schema.fields().len(),
-                                version = new_table.version(),
-                            );
-                            shared_schema.store(new_schema);
-                        }
-
                         // Get the byte size from the request (Arrow in-memory size)
                         let bytes_written = request.byte_size;
+                        let new_version = new_table.version();
+
+                        // Only update schema cache if schema evolution is enabled.
+                        // NOTE: new_table.schema() can block on I/O (reads snapshot metadata),
+                        // so we wrap it in spawn_blocking to avoid deadlocking the async runtime.
+                        if schema_evolution {
+                            let shared_schema_clone = Arc::clone(&shared_schema);
+                            if let Ok(new_schema) =
+                                tokio::task::spawn_blocking(move || new_table.schema()).await
+                            {
+                                let old_schema = shared_schema_clone.load();
+                                let new_fields: Vec<_> = new_schema
+                                    .fields()
+                                    .iter()
+                                    .filter(|f| old_schema.field_with_name(f.name()).is_err())
+                                    .map(|f| f.name().as_str())
+                                    .collect();
+
+                                if !new_fields.is_empty() {
+                                    info!(
+                                        message = "Schema evolution: new fields added to table",
+                                        new_fields = ?new_fields,
+                                        total_fields = new_schema.fields().len(),
+                                        version = new_version,
+                                    );
+                                    shared_schema_clone.store(new_schema);
+                                }
+                            }
+                        }
 
                         info!(
                             message = "Delta write operation completed",
-                            version = new_table.version(),
+                            version = new_version,
                             elapsed_ms = write_start.elapsed().as_millis() as u64,
                             bytes_written = bytes_written,
                         );
