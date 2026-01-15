@@ -16,6 +16,117 @@ use crate::sinks::prelude::*;
 
 use super::request_builder::{DeltaLakeRequest, SharedSchema};
 
+/// Classification of Delta Lake write errors.
+///
+/// Provides a single source of truth for error handling decisions,
+/// consolidating logic that was previously spread across multiple functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteErrorKind {
+    /// Concurrent transaction conflict (e.g., from optimize/vacuum or another writer).
+    /// Should be retried internally with table reload, not at Tower level.
+    ConcurrentConflict,
+    /// Schema mismatch between incoming data and table schema.
+    /// May be retriable with schema evolution enabled.
+    SchemaMismatch,
+    /// Permission or authentication error. Non-retriable.
+    PermissionDenied,
+    /// Resource not found. Non-retriable.
+    NotFound,
+    /// Transient error (network, timeout, etc.). Retriable.
+    Transient,
+    /// Permanent error that won't be fixed by retrying.
+    Permanent,
+}
+
+impl WriteErrorKind {
+    /// Classify a DeltaTableError into a WriteErrorKind.
+    pub fn from_delta_error(error: &DeltaTableError) -> Self {
+        match error {
+            // ObjectStore errors - classify based on variant
+            DeltaTableError::ObjectStore { source } => Self::from_object_store_error(source),
+
+            // Transaction errors - check for concurrent conflicts
+            DeltaTableError::Transaction { source } => {
+                let s = source.to_string();
+                if s.contains("ConcurrentDeleteRead")
+                    || s.contains("concurrent transaction deleted")
+                {
+                    WriteErrorKind::ConcurrentConflict
+                } else {
+                    WriteErrorKind::Permanent
+                }
+            }
+
+            // Schema-related errors
+            DeltaTableError::Arrow { .. }
+            | DeltaTableError::InvalidData { .. }
+            | DeltaTableError::SchemaMismatch { .. } => WriteErrorKind::SchemaMismatch,
+
+            // IO errors are typically transient
+            DeltaTableError::Io { .. } => WriteErrorKind::Transient,
+
+            // Kernel errors are typically permanent
+            DeltaTableError::Kernel { .. } => WriteErrorKind::Permanent,
+
+            // For other errors, check the message for schema-related keywords
+            _ => {
+                let error_str = error.to_string().to_lowercase();
+                if error_str.contains("schema")
+                    || error_str.contains("field")
+                    || error_str.contains("column")
+                    || error_str.contains("incompatible")
+                    || error_str.contains("type mismatch")
+                {
+                    WriteErrorKind::SchemaMismatch
+                } else {
+                    WriteErrorKind::Transient
+                }
+            }
+        }
+    }
+
+    /// Classify an ObjectStoreError into a WriteErrorKind.
+    fn from_object_store_error(error: &ObjectStoreError) -> Self {
+        match error {
+            // Concurrent conflicts - handled internally with table reload
+            ObjectStoreError::Precondition { .. } | ObjectStoreError::AlreadyExists { .. } => {
+                WriteErrorKind::ConcurrentConflict
+            }
+
+            // Permission errors - non-retriable
+            ObjectStoreError::PermissionDenied { .. }
+            | ObjectStoreError::Unauthenticated { .. } => WriteErrorKind::PermissionDenied,
+
+            // Not found - non-retriable
+            ObjectStoreError::NotFound { .. } => WriteErrorKind::NotFound,
+
+            // Configuration/structural errors - permanent
+            ObjectStoreError::NotSupported { .. }
+            | ObjectStoreError::NotImplemented
+            | ObjectStoreError::UnknownConfigurationKey { .. }
+            | ObjectStoreError::InvalidPath { .. } => WriteErrorKind::Permanent,
+
+            // All other errors (network, timeouts, etc.) - transient
+            _ => WriteErrorKind::Transient,
+        }
+    }
+
+    /// Returns true if this error kind should be retried at the Tower level.
+    pub fn is_retriable_at_tower_level(&self) -> bool {
+        matches!(self, WriteErrorKind::Transient)
+    }
+
+    /// Returns true if this error kind represents a concurrent conflict.
+    pub fn is_concurrent_conflict(&self) -> bool {
+        matches!(self, WriteErrorKind::ConcurrentConflict)
+    }
+
+    /// Returns true if this error kind represents a schema mismatch.
+    pub fn is_schema_mismatch(&self) -> bool {
+        matches!(self, WriteErrorKind::SchemaMismatch)
+    }
+}
+
 /// Response from Delta Lake write operations.
 ///
 /// Contains metrics about the write operation including the number of files
@@ -71,57 +182,6 @@ impl DeltaLakeService {
             storage_options,
             schema_evolution,
             shared_schema,
-        }
-    }
-
-    /// Check if an error indicates a schema mismatch.
-    ///
-    /// Schema mismatch errors occur when:
-    /// - Writing data with different field types
-    /// - Writing data with new columns (without merge mode)
-    /// - Writing data missing required non-nullable columns
-    fn is_schema_mismatch_error(error: &DeltaTableError) -> bool {
-        // First check for explicit schema-related error variants
-        if matches!(
-            error,
-            DeltaTableError::Arrow { .. }
-                | DeltaTableError::InvalidData { .. }
-                | DeltaTableError::SchemaMismatch { .. }
-        ) {
-            return true;
-        }
-
-        // Fallback to string matching for wrapped errors
-        let error_str = error.to_string().to_lowercase();
-        error_str.contains("schema")
-            || error_str.contains("field")
-            || error_str.contains("column")
-            || error_str.contains("incompatible")
-            || error_str.contains("type mismatch")
-    }
-
-    /// Check if an error indicates a concurrent transaction conflict.
-    ///
-    /// Concurrent conflicts can manifest as:
-    /// 1. Transaction errors with ConcurrentDeleteRead (from optimize/vacuum)
-    /// 2. ObjectStore errors with Precondition/AlreadyExists (from concurrent writes)
-    ///    GCS returns FAILED_PRECONDITION when conditional write (if-generation-match)
-    ///    fails because another writer committed the same version first.
-    fn is_concurrent_conflict(error: &DeltaTableError) -> bool {
-        match error {
-            // Handle ObjectStore errors with structured matching
-            DeltaTableError::ObjectStore { source } => {
-                matches!(
-                    source,
-                    ObjectStoreError::Precondition { .. } | ObjectStoreError::AlreadyExists { .. }
-                )
-            }
-            // Transaction errors need string matching since TransactionError is opaque
-            DeltaTableError::Transaction { source } => {
-                let s = source.to_string();
-                s.contains("ConcurrentDeleteRead") || s.contains("concurrent transaction deleted")
-            }
-            _ => false,
         }
     }
 }
@@ -235,24 +295,22 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                         });
                     }
                     Err(e) => {
-                        // Classify the error using structured pattern matching
-                        let is_concurrent_conflict = Self::is_concurrent_conflict(&e);
-                        let is_schema_mismatch = Self::is_schema_mismatch_error(&e);
+                        // Classify the error using WriteErrorKind for consistent handling
+                        let error_kind = WriteErrorKind::from_delta_error(&e);
 
                         // Log error classification for debugging retry behavior
                         warn!(
                             message = "Delta Lake write error occurred",
                             error = %e,
                             error_debug = ?e,
-                            is_concurrent_conflict = is_concurrent_conflict,
-                            is_schema_mismatch = is_schema_mismatch,
+                            error_kind = ?error_kind,
                             conflict_retry_count = conflict_retry_count,
                             schema_retry_count = schema_retry_count,
                         );
 
                         // Handle schema mismatch errors with reload and retry (if enabled)
                         if schema_evolution
-                            && is_schema_mismatch
+                            && error_kind.is_schema_mismatch()
                             && schema_retry_count < MAX_SCHEMA_RETRIES
                         {
                             schema_retry_count += 1;
@@ -280,7 +338,9 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                         }
 
                         // Handle concurrent transaction conflicts
-                        if is_concurrent_conflict && conflict_retry_count < MAX_CONFLICT_RETRIES {
+                        if error_kind.is_concurrent_conflict()
+                            && conflict_retry_count < MAX_CONFLICT_RETRIES
+                        {
                             conflict_retry_count += 1;
 
                             // Apply exponential backoff before retry to reduce thundering herd
@@ -307,25 +367,29 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                             continue;
                         }
 
-                        // Not retriable, or exhausted retries
-                        if is_schema_mismatch {
-                            error!(
-                                message = "Exhausted retries for schema mismatch",
-                                error = %e,
-                                retry_count = schema_retry_count,
-                            );
-                        } else if is_concurrent_conflict {
-                            error!(
-                                message = "Exhausted retries for concurrent conflict",
-                                error = %e,
-                                retry_count = conflict_retry_count,
-                            );
-                        } else {
-                            error!(
-                                message = "Non-retriable Delta Lake error, not classified as conflict or schema mismatch",
-                                error = %e,
-                                error_debug = ?e,
-                            );
+                        // Not retriable, or exhausted retries - log appropriate message
+                        match error_kind {
+                            WriteErrorKind::SchemaMismatch => {
+                                error!(
+                                    message = "Exhausted retries for schema mismatch",
+                                    error = %e,
+                                    retry_count = schema_retry_count,
+                                );
+                            }
+                            WriteErrorKind::ConcurrentConflict => {
+                                error!(
+                                    message = "Exhausted retries for concurrent conflict",
+                                    error = %e,
+                                    retry_count = conflict_retry_count,
+                                );
+                            }
+                            _ => {
+                                error!(
+                                    message = "Non-retriable Delta Lake error",
+                                    error = %e,
+                                    error_kind = ?error_kind,
+                                );
+                            }
                         }
                         return Err(e);
                     }
@@ -337,46 +401,10 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
 
 /// Retry logic for Delta Lake operations.
 ///
-/// Determines which errors are retriable (network/storage) vs non-retriable (schema/data).
-/// Mirrors the GCS sink's retry logic for HTTP status codes that appear in object_store errors.
+/// Determines which errors are retriable at the Tower level.
+/// Uses WriteErrorKind for consistent error classification across the codebase.
 #[derive(Debug, Clone, Default)]
 pub struct DeltaLakeRetryLogic;
-
-impl DeltaLakeRetryLogic {
-    /// Check if an ObjectStore error is non-retriable.
-    ///
-    /// Uses structured matching on object_store::Error variants for type-safe classification.
-    /// Most ObjectStore errors should be retried (network issues, rate limits, server errors).
-    /// Only permanent client errors should NOT be retried.
-    fn is_non_retriable_object_store_error(error: &ObjectStoreError) -> bool {
-        matches!(
-            error,
-            // Permission denied - credentials/ACL issues won't resolve on retry
-            ObjectStoreError::PermissionDenied { .. }
-                | ObjectStoreError::Unauthenticated { .. }
-                // Resource doesn't exist - won't magically appear
-                | ObjectStoreError::NotFound { .. }
-                // Not supported/implemented - structural issues
-                | ObjectStoreError::NotSupported { .. }
-                | ObjectStoreError::NotImplemented
-                // Configuration errors - won't fix themselves
-                | ObjectStoreError::UnknownConfigurationKey { .. }
-                // Invalid path - structural issue
-                | ObjectStoreError::InvalidPath { .. }
-        )
-    }
-
-    /// Check if a concurrent conflict error (should not retry at Tower level).
-    ///
-    /// Precondition failures are handled internally with table reload.
-    /// Retrying here without reload would cause infinite loops with stale version numbers.
-    fn is_concurrent_conflict_error(error: &ObjectStoreError) -> bool {
-        matches!(
-            error,
-            ObjectStoreError::Precondition { .. } | ObjectStoreError::AlreadyExists { .. }
-        )
-    }
-}
 
 impl RetryLogic for DeltaLakeRetryLogic {
     type Error = DeltaTableError;
@@ -384,31 +412,6 @@ impl RetryLogic for DeltaLakeRetryLogic {
     type Response = DeltaLakeResponse;
 
     fn is_retriable_error(&self, error: &Self::Error) -> bool {
-        match error {
-            // ObjectStore errors - use structured matching
-            DeltaTableError::ObjectStore { source } => {
-                // Don't retry concurrent conflicts - handled internally with table reload
-                if Self::is_concurrent_conflict_error(source) {
-                    return false;
-                }
-                // Don't retry permanent client errors
-                !Self::is_non_retriable_object_store_error(source)
-            }
-
-            // IO errors are typically transient - retry
-            DeltaTableError::Io { .. } => true,
-
-            // Don't retry schema/data errors - they require code changes to fix
-            DeltaTableError::Arrow { .. }
-            | DeltaTableError::Kernel { .. }
-            | DeltaTableError::InvalidData { .. }
-            | DeltaTableError::SchemaMismatch { .. } => false,
-
-            // Transaction errors - don't retry at Tower level (handled internally)
-            DeltaTableError::Transaction { .. } => false,
-
-            // Other errors - default to retriable (network issues, timeouts, etc.)
-            _ => true,
-        }
+        WriteErrorKind::from_delta_error(error).is_retriable_at_tower_level()
     }
 }
