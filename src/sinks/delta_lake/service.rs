@@ -18,34 +18,27 @@ use super::request_builder::{DeltaLakeRequest, SharedSchema};
 
 /// Classification of Delta Lake write errors.
 ///
-/// Provides a single source of truth for error handling decisions,
-/// consolidating logic that was previously spread across multiple functions.
+/// Provides a single source of truth for error handling decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteErrorKind {
     /// Concurrent transaction conflict (e.g., from optimize/vacuum or another writer).
-    /// Should be retried internally with table reload, not at Tower level.
+    /// Retried internally with table reload.
     ConcurrentConflict,
     /// Schema mismatch between incoming data and table schema.
-    /// May be retriable with schema evolution enabled.
+    /// Retried internally with schema reload (if schema evolution is enabled).
     SchemaMismatch,
-    /// Permission or authentication error. Non-retriable.
-    PermissionDenied,
-    /// Resource not found. Non-retriable.
-    NotFound,
-    /// Transient error (network, timeout, etc.). Retriable.
+    /// Transient error (network, IO, timeout). Retried at Tower level.
     Transient,
-    /// Permanent error that won't be fixed by retrying.
-    Permanent,
+    /// Non-retriable error (permissions, not found, invalid config, etc.).
+    NonRetriable,
 }
 
 impl WriteErrorKind {
     /// Classify a DeltaTableError into a WriteErrorKind.
     pub fn from_delta_error(error: &DeltaTableError) -> Self {
         match error {
-            // ObjectStore errors - classify based on variant
             DeltaTableError::ObjectStore { source } => Self::from_object_store_error(source),
 
-            // Transaction errors - check for concurrent conflicts
             DeltaTableError::Transaction { source } => {
                 let s = source.to_string();
                 if s.contains("ConcurrentDeleteRead")
@@ -53,22 +46,18 @@ impl WriteErrorKind {
                 {
                     WriteErrorKind::ConcurrentConflict
                 } else {
-                    WriteErrorKind::Permanent
+                    WriteErrorKind::NonRetriable
                 }
             }
 
-            // Schema-related errors
             DeltaTableError::Arrow { .. }
             | DeltaTableError::InvalidData { .. }
             | DeltaTableError::SchemaMismatch { .. } => WriteErrorKind::SchemaMismatch,
 
-            // IO errors are typically transient
             DeltaTableError::Io { .. } => WriteErrorKind::Transient,
 
-            // Kernel errors are typically permanent
-            DeltaTableError::Kernel { .. } => WriteErrorKind::Permanent,
+            DeltaTableError::Kernel { .. } => WriteErrorKind::NonRetriable,
 
-            // For other errors, check the message for schema-related keywords
             _ => {
                 let error_str = error.to_string().to_lowercase();
                 if error_str.contains("schema")
@@ -85,43 +74,33 @@ impl WriteErrorKind {
         }
     }
 
-    /// Classify an ObjectStoreError into a WriteErrorKind.
     fn from_object_store_error(error: &ObjectStoreError) -> Self {
         match error {
-            // Concurrent conflicts - handled internally with table reload
             ObjectStoreError::Precondition { .. } | ObjectStoreError::AlreadyExists { .. } => {
                 WriteErrorKind::ConcurrentConflict
             }
-
-            // Permission errors - non-retriable
             ObjectStoreError::PermissionDenied { .. }
-            | ObjectStoreError::Unauthenticated { .. } => WriteErrorKind::PermissionDenied,
-
-            // Not found - non-retriable
-            ObjectStoreError::NotFound { .. } => WriteErrorKind::NotFound,
-
-            // Configuration/structural errors - permanent
-            ObjectStoreError::NotSupported { .. }
+            | ObjectStoreError::Unauthenticated { .. }
+            | ObjectStoreError::NotFound { .. }
+            | ObjectStoreError::NotSupported { .. }
             | ObjectStoreError::NotImplemented
             | ObjectStoreError::UnknownConfigurationKey { .. }
-            | ObjectStoreError::InvalidPath { .. } => WriteErrorKind::Permanent,
-
-            // All other errors (network, timeouts, etc.) - transient
+            | ObjectStoreError::InvalidPath { .. } => WriteErrorKind::NonRetriable,
             _ => WriteErrorKind::Transient,
         }
     }
 
-    /// Returns true if this error kind should be retried at the Tower level.
+    /// Returns true if this error should be retried at the Tower level.
     pub fn is_retriable_at_tower_level(&self) -> bool {
         matches!(self, WriteErrorKind::Transient)
     }
 
-    /// Returns true if this error kind represents a concurrent conflict.
+    /// Returns true if this is a concurrent conflict requiring table reload.
     pub fn is_concurrent_conflict(&self) -> bool {
         matches!(self, WriteErrorKind::ConcurrentConflict)
     }
 
-    /// Returns true if this error kind represents a schema mismatch.
+    /// Returns true if this is a schema mismatch requiring schema reload.
     pub fn is_schema_mismatch(&self) -> bool {
         matches!(self, WriteErrorKind::SchemaMismatch)
     }
