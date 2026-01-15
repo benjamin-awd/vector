@@ -46,20 +46,6 @@ impl DriverResponse for DeltaLakeResponse {
 }
 
 /// Tower service for Delta Lake writes.
-///
-/// This service writes Arrow RecordBatches directly to Delta Lake tables,
-/// avoiding the overhead of Parquet serialization/deserialization round-trips.
-///
-/// Opens a fresh table connection for each write request to ensure bounded memory
-/// usage. This prevents accumulation of transaction log state that can cause OOM
-/// issues with tables that have many versions.
-///
-/// ## Schema Evolution Support
-///
-/// This service supports automatic schema evolution through Delta Lake's merge mode.
-/// When schema mismatches are detected, the service will:
-/// 1. Reload the table to get the latest schema
-/// 2. Retry the write operation with schema merge enabled
 #[derive(Clone)]
 pub struct DeltaLakeService {
     /// Table URI for opening fresh connections
@@ -128,11 +114,6 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
         Box::pin(async move {
             // Use batches directly from request - no Parquet deserialization needed
             let batches = request.batches;
-
-            // Open a fresh table connection for each request to ensure bounded memory.
-            // This prevents accumulation of transaction log state that can cause OOM
-            // issues with tables that have many versions (e.g., 20k+ versions).
-            // The table is dropped at the end of each request, freeing all memory.
             let parsed_uri = Url::parse(&table_uri).map_err(|e| {
                 DeltaTableError::Generic(format!("Invalid table URI {}: {}", table_uri, e))
             })?;
@@ -184,8 +165,6 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                 match write_builder.await {
                     Ok(new_table) => {
                         // Update schema cache for request builder (used for schema evolution)
-                        // We don't cache the full table state since we reload before each write,
-                        // which bounds memory usage by not accumulating transaction log state.
                         let new_schema = new_table.schema();
                         let old_schema = shared_schema.load();
 
