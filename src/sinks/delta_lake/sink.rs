@@ -3,10 +3,13 @@
 //! This module implements the main sink that orchestrates the flow of events
 //! from Vector to Delta Lake tables.
 
-use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+use tracing::Span;
 
 use crate::sinks::prelude::*;
 use crate::sinks::util::builder::SinkBuilderExt;
+use crate::sinks::util::request_builder::default_request_builder_concurrency_limit;
 
 use super::request_builder::{DeltaLakeRequest, DeltaLakeRequestBuilder};
 
@@ -48,18 +51,21 @@ where
 
     async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         let batch_settings = self.batch_settings.as_byte_size_config();
-        let request_builder = self.request_builder;
-        let concurrency = NonZeroUsize::new(8).expect("static");
+        let request_builder = Arc::new(self.request_builder);
+        let concurrency = default_request_builder_concurrency_limit();
+
+        let span = Arc::new(Span::current());
 
         input
-            // Batch events by size/time
             .batched(batch_settings)
-            // Build requests (convert directly to RecordBatch - no Parquet round-trip)
             .concurrent_map(concurrency, move |events| {
-                let builder = request_builder.clone();
-                Box::pin(async move { builder.build_request(events) })
+                let builder = Arc::clone(&request_builder);
+                let span = Arc::clone(&span);
+                Box::pin(async move {
+                    let _entered = span.enter();
+                    builder.build_request(events)
+                })
             })
-            // Filter out failed request builds
             .filter_map(|request| async {
                 match request {
                     Err(error) => {
@@ -69,7 +75,6 @@ where
                     Ok(req) => Some(req),
                 }
             })
-            // Send to Delta Lake service
             .into_driver(self.service)
             .run()
             .await
