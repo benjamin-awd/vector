@@ -1,16 +1,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use deltalake::DeltaTableError;
 use deltalake::ObjectStoreError;
 use deltalake::datafusion::datasource::TableProvider;
+use deltalake::kernel::transaction::CommitProperties;
 use deltalake::operations::write::SchemaMode;
 use deltalake::protocol::SaveMode;
 use url::Url;
 
-use crate::common::backoff::ExponentialBackoff;
 use crate::internal_events::EndpointBytesSent;
 use crate::sinks::prelude::*;
 
@@ -205,18 +204,13 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                         ))
                     })?;
 
-            // Retry loop for handling concurrent transaction conflicts and schema evolution
-            // When optimization operations (like z-order) rewrite files, or when schema changes,
-            // we need to reload the table snapshot and retry the write
+            // Retry loop for schema mismatch errors only
+            // Concurrent conflicts are handled automatically by delta-rs via CommitProperties
             const MAX_CONFLICT_RETRIES: usize = 5;
             const MAX_SCHEMA_RETRIES: usize = 1;
-            let mut conflict_retry_count = 0;
             let mut schema_retry_count = 0;
-            // Exponential backoff for conflict retries to reduce thundering herd effect
-            let mut backoff = ExponentialBackoff::default().max_delay(Duration::from_secs(30));
 
             loop {
-                // Log retry attempt for schema evolution
                 if schema_retry_count > 0 {
                     info!(
                         message = "Retrying write after schema reload",
@@ -224,16 +218,15 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                     );
                 }
 
-                // Build write operation using DeltaTable methods directly
-                // This supports schema merge mode for true schema evolution
-                // Clone batches for potential retries (RecordBatch clone is cheap - uses Arc internally)
+                // Build write operation with built-in conflict retry via CommitProperties
                 let mut write_builder = table
                     .clone()
                     .write(batches.clone())
-                    .with_save_mode(SaveMode::Append);
+                    .with_save_mode(SaveMode::Append)
+                    .with_commit_properties(
+                        CommitProperties::default().with_max_retries(MAX_CONFLICT_RETRIES),
+                    );
 
-                // Enable schema merge when schema evolution is enabled
-                // This allows adding new columns from incoming data
                 if schema_evolution {
                     write_builder = write_builder.with_schema_mode(SchemaMode::Merge);
                 }
@@ -281,16 +274,14 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                         });
                     }
                     Err(e) => {
-                        // Classify the error using WriteErrorKind for consistent handling
+                        // Classify error for schema mismatch handling
+                        // (concurrent conflicts are handled by delta-rs via CommitProperties)
                         let error_kind = WriteErrorKind::from_delta_error(&e);
 
-                        // Log error classification for debugging retry behavior
                         warn!(
                             message = "Delta Lake write error occurred",
                             error = %e,
-                            error_debug = ?e,
                             error_kind = ?error_kind,
-                            conflict_retry_count = conflict_retry_count,
                             schema_retry_count = schema_retry_count,
                         );
 
@@ -308,7 +299,6 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                             );
 
                             // Reload the table to get the latest schema
-                            // This picks up schema evolution changes (new columns, type changes, etc.)
                             table.load().await.map_err(|load_err| {
                                 DeltaTableError::Generic(format!(
                                     "Failed to reload table after schema mismatch: {}",
@@ -316,66 +306,23 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                                 ))
                             })?;
 
-                            // Reset conflict retry count for fresh attempt
-                            conflict_retry_count = 0;
-
-                            // Continue to retry with fresh schema
                             continue;
                         }
 
-                        // Handle concurrent transaction conflicts
-                        if error_kind.is_concurrent_conflict()
-                            && conflict_retry_count < MAX_CONFLICT_RETRIES
-                        {
-                            conflict_retry_count += 1;
-
-                            // Apply exponential backoff before retry to reduce thundering herd
-                            let backoff_duration =
-                                backoff.next().unwrap_or(Duration::from_secs(30));
-                            warn!(
-                                message = "Concurrent table modification detected, backing off then reloading",
-                                retry_count = conflict_retry_count,
-                                max_retries = MAX_CONFLICT_RETRIES,
-                                backoff_ms = backoff_duration.as_millis(),
+                        // Log final error
+                        if error_kind.is_schema_mismatch() {
+                            error!(
+                                message = "Schema mismatch - exhausted retries or schema evolution disabled",
+                                error = %e,
+                                schema_evolution = schema_evolution,
+                                retry_count = schema_retry_count,
                             );
-                            tokio::time::sleep(backoff_duration).await;
-
-                            // Reload the table to get the latest snapshot
-                            // This picks up changes from optimize/vacuum operations
-                            table.load().await.map_err(|load_err| {
-                                DeltaTableError::Generic(format!(
-                                    "Failed to reload table after conflict: {}",
-                                    load_err
-                                ))
-                            })?;
-
-                            // Continue to retry with fresh snapshot
-                            continue;
-                        }
-
-                        // Not retriable, or exhausted retries - log appropriate message
-                        match error_kind {
-                            WriteErrorKind::SchemaMismatch => {
-                                error!(
-                                    message = "Exhausted retries for schema mismatch",
-                                    error = %e,
-                                    retry_count = schema_retry_count,
-                                );
-                            }
-                            WriteErrorKind::ConcurrentConflict => {
-                                error!(
-                                    message = "Exhausted retries for concurrent conflict",
-                                    error = %e,
-                                    retry_count = conflict_retry_count,
-                                );
-                            }
-                            _ => {
-                                error!(
-                                    message = "Non-retriable Delta Lake error",
-                                    error = %e,
-                                    error_kind = ?error_kind,
-                                );
-                            }
+                        } else {
+                            error!(
+                                message = "Delta Lake write failed",
+                                error = %e,
+                                error_kind = ?error_kind,
+                            );
                         }
                         return Err(e);
                     }
