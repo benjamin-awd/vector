@@ -194,6 +194,9 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                 DeltaTableError::Generic(format!("Invalid table URI {}: {}", table_uri, e))
             })?;
 
+            info!(message = "Opening Delta table", table_uri = %table_uri);
+            let open_start = std::time::Instant::now();
+
             let mut table =
                 deltalake::open_table_with_storage_options(parsed_uri, storage_options.clone())
                     .await
@@ -203,6 +206,13 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                             table_uri, e
                         ))
                     })?;
+
+            info!(
+                message = "Delta table opened",
+                table_uri = %table_uri,
+                version = table.version(),
+                elapsed_ms = open_start.elapsed().as_millis() as u64,
+            );
 
             // Retry loop for schema mismatch errors only
             // Concurrent conflicts are handled automatically by delta-rs via CommitProperties
@@ -232,6 +242,17 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                 }
 
                 // Execute write and commit
+                let write_start = std::time::Instant::now();
+                let batch_count = batches.len();
+                let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                info!(
+                    message = "Starting Delta write operation",
+                    version = table.version(),
+                    batch_count = batch_count,
+                    row_count = row_count,
+                    schema_retry_count = schema_retry_count,
+                );
+
                 match write_builder.await {
                     Ok(new_table) => {
                         // Update schema cache for request builder (used for schema evolution)
@@ -259,6 +280,13 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                         // Get the byte size from the request (Arrow in-memory size)
                         let bytes_written = request.byte_size;
 
+                        info!(
+                            message = "Delta write operation completed",
+                            version = new_table.version(),
+                            elapsed_ms = write_start.elapsed().as_millis() as u64,
+                            bytes_written = bytes_written,
+                        );
+
                         emit!(EndpointBytesSent {
                             byte_size: bytes_written,
                             protocol: "delta_lake",
@@ -277,12 +305,14 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                         // Classify error for schema mismatch handling
                         // (concurrent conflicts are handled by delta-rs via CommitProperties)
                         let error_kind = WriteErrorKind::from_delta_error(&e);
+                        let elapsed_ms = write_start.elapsed().as_millis() as u64;
 
                         warn!(
                             message = "Delta Lake write error occurred",
                             error = %e,
                             error_kind = ?error_kind,
                             schema_retry_count = schema_retry_count,
+                            elapsed_ms = elapsed_ms,
                         );
 
                         // Handle schema mismatch errors with reload and retry (if enabled)
