@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use deltalake::DeltaTableBuilder;
 use deltalake::DeltaTableError;
 use deltalake::ObjectStoreError;
 use deltalake::datafusion::datasource::TableProvider;
 use deltalake::kernel::transaction::CommitProperties;
+use deltalake::logstore::IORuntime;
 use deltalake::operations::write::SchemaMode;
 use deltalake::protocol::SaveMode;
 use url::Url;
@@ -97,17 +99,17 @@ impl WriteErrorKind {
     }
 
     /// Returns true if this error should be retried at the Tower level.
-    pub fn is_retriable_at_tower_level(&self) -> bool {
+    pub const fn is_retriable_at_tower_level(&self) -> bool {
         matches!(self, WriteErrorKind::Transient)
     }
 
     /// Returns true if this is a concurrent conflict requiring table reload.
-    pub fn is_concurrent_conflict(&self) -> bool {
+    pub const fn is_concurrent_conflict(&self) -> bool {
         matches!(self, WriteErrorKind::ConcurrentConflict)
     }
 
     /// Returns true if this is a schema mismatch requiring schema reload.
-    pub fn is_schema_mismatch(&self) -> bool {
+    pub const fn is_schema_mismatch(&self) -> bool {
         matches!(self, WriteErrorKind::SchemaMismatch)
     }
 }
@@ -190,22 +192,31 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
         Box::pin(async move {
             // Use batches directly from request - no Parquet deserialization needed
             let batches = request.batches;
-            let parsed_uri = Url::parse(&table_uri).map_err(|e| {
+
+            let parsed_url = Url::parse(&table_uri).map_err(|e| {
                 DeltaTableError::Generic(format!("Invalid table URI {}: {}", table_uri, e))
             })?;
 
-            info!(message = "Opening Delta table", table_uri = %table_uri);
+            debug!(message = "Opening Delta table", table_uri = %table_uri);
             let open_start = std::time::Instant::now();
 
-            let mut table =
-                deltalake::open_table_with_storage_options(parsed_uri, storage_options.clone())
-                    .await
-                    .map_err(|e| {
-                        DeltaTableError::Generic(format!(
-                            "Failed to open table {}: {}",
-                            table_uri, e
-                        ))
-                    })?;
+            // Use DeltaTableBuilder with IORuntime to prevent blocking I/O deadlocks.
+            // IORuntime spawns I/O operations on a separate runtime, preventing tokio
+            // worker threads from being blocked by synchronous operations in object_store.
+            let mut table = DeltaTableBuilder::from_url(parsed_url)
+                .map_err(|e| {
+                    DeltaTableError::Generic(format!(
+                        "Failed to create table builder for {}: {}",
+                        table_uri, e
+                    ))
+                })?
+                .with_io_runtime(IORuntime::default())
+                .with_storage_options(storage_options.clone())
+                .load()
+                .await
+                .map_err(|e| {
+                    DeltaTableError::Generic(format!("Failed to open table {}: {}", table_uri, e))
+                })?;
 
             info!(
                 message = "Delta table opened",
