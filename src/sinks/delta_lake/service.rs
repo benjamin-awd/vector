@@ -86,7 +86,14 @@ impl WriteErrorKind {
             | ObjectStoreError::NotImplemented
             | ObjectStoreError::UnknownConfigurationKey { .. }
             | ObjectStoreError::InvalidPath { .. } => WriteErrorKind::NonRetriable,
-            _ => WriteErrorKind::Transient,
+            _ => {
+                warn!(
+                    message = "ObjectStore transient error, will retry at Tower level",
+                    error = %error,
+                    error_debug = ?error,
+                );
+                WriteErrorKind::Transient
+            }
         }
     }
 
