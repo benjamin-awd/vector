@@ -4,6 +4,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use deltalake::DeltaTableError;
+use deltalake::ObjectStoreError;
 use deltalake::datafusion::datasource::TableProvider;
 use deltalake::operations::write::SchemaMode;
 use deltalake::protocol::SaveMode;
@@ -80,18 +81,48 @@ impl DeltaLakeService {
     /// - Writing data with new columns (without merge mode)
     /// - Writing data missing required non-nullable columns
     fn is_schema_mismatch_error(error: &DeltaTableError) -> bool {
+        // First check for explicit schema-related error variants
+        if matches!(
+            error,
+            DeltaTableError::Arrow { .. }
+                | DeltaTableError::InvalidData { .. }
+                | DeltaTableError::SchemaMismatch { .. }
+        ) {
+            return true;
+        }
+
+        // Fallback to string matching for wrapped errors
         let error_str = error.to_string().to_lowercase();
         error_str.contains("schema")
             || error_str.contains("field")
             || error_str.contains("column")
             || error_str.contains("incompatible")
             || error_str.contains("type mismatch")
-            || matches!(
-                error,
-                DeltaTableError::Arrow { .. }
-                    | DeltaTableError::InvalidData { .. }
-                    | DeltaTableError::SchemaMismatch { .. }
-            )
+    }
+
+    /// Check if an error indicates a concurrent transaction conflict.
+    ///
+    /// Concurrent conflicts can manifest as:
+    /// 1. Transaction errors with ConcurrentDeleteRead (from optimize/vacuum)
+    /// 2. ObjectStore errors with Precondition/AlreadyExists (from concurrent writes)
+    ///    GCS returns FAILED_PRECONDITION when conditional write (if-generation-match)
+    ///    fails because another writer committed the same version first.
+    fn is_concurrent_conflict(error: &DeltaTableError) -> bool {
+        match error {
+            // Handle ObjectStore errors with structured matching
+            DeltaTableError::ObjectStore { source } => {
+                matches!(
+                    source,
+                    ObjectStoreError::Precondition { .. } | ObjectStoreError::AlreadyExists { .. }
+                )
+            }
+            // Transaction errors need string matching since TransactionError is opaque
+            DeltaTableError::Transaction { source } => {
+                let s = source.to_string();
+                s.contains("ConcurrentDeleteRead") || s.contains("concurrent transaction deleted")
+            }
+            _ => false,
+        }
     }
 }
 
@@ -204,32 +235,8 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
                         });
                     }
                     Err(e) => {
-                        // Check error type for appropriate retry strategy
-                        // Concurrent conflicts can manifest as:
-                        // 1. Transaction errors with ConcurrentDeleteRead (from optimize/vacuum)
-                        // 2. ObjectStore errors with FAILED_PRECONDITION (from concurrent writes)
-                        //    GCS returns FAILED_PRECONDITION when conditional write (if-generation-match)
-                        //    fails because another writer committed the same version first.
-                        let error_str = e.to_string();
-                        let error_lower = error_str.to_lowercase();
-                        // Detect concurrent conflicts from various sources:
-                        // 1. Delta transaction conflicts (ConcurrentDeleteRead from optimize/vacuum)
-                        // 2. GCS FAILED_PRECONDITION (HTTP 412) from conditional writes
-                        //    GCS returns 412 when if-generation-match fails because another
-                        //    writer committed the same version first.
-                        let is_concurrent_conflict = matches!(
-                            &e,
-                            DeltaTableError::Transaction { source }
-                                if source.to_string().contains("ConcurrentDeleteRead")
-                                    || source.to_string().contains("concurrent transaction deleted")
-                        ) || matches!(
-                            &e,
-                            DeltaTableError::ObjectStore { .. }
-                                if error_lower.contains("failed_precondition")
-                                    || error_lower.contains("precondition")
-                                    || error_str.contains("412")
-                        );
-
+                        // Classify the error using structured pattern matching
+                        let is_concurrent_conflict = Self::is_concurrent_conflict(&e);
                         let is_schema_mismatch = Self::is_schema_mismatch_error(&e);
 
                         // Log error classification for debugging retry behavior
@@ -336,53 +343,38 @@ impl Service<DeltaLakeRequest> for DeltaLakeService {
 pub struct DeltaLakeRetryLogic;
 
 impl DeltaLakeRetryLogic {
-    /// Check if an error string indicates a non-retriable GCS HTTP error.
+    /// Check if an ObjectStore error is non-retriable.
     ///
-    /// Most GCS errors should be retried (network issues, rate limits, server errors).
-    /// Only permanent client errors should NOT be retried:
-    /// - 400 Bad Request: Malformed request
-    /// - 403 Forbidden: Permission denied (won't change on retry)
-    /// - 404 Not Found: Resource doesn't exist
-    /// - 405 Method Not Allowed: Wrong HTTP method
-    /// - 409 Conflict: (Note: FAILED_PRECONDITION is handled separately)
-    /// - 410 Gone: Resource permanently deleted
-    fn is_non_retriable_gcs_error(error_str: &str) -> bool {
-        let error_lower = error_str.to_lowercase();
+    /// Uses structured matching on object_store::Error variants for type-safe classification.
+    /// Most ObjectStore errors should be retried (network issues, rate limits, server errors).
+    /// Only permanent client errors should NOT be retried.
+    fn is_non_retriable_object_store_error(error: &ObjectStoreError) -> bool {
+        matches!(
+            error,
+            // Permission denied - credentials/ACL issues won't resolve on retry
+            ObjectStoreError::PermissionDenied { .. }
+                | ObjectStoreError::Unauthenticated { .. }
+                // Resource doesn't exist - won't magically appear
+                | ObjectStoreError::NotFound { .. }
+                // Not supported/implemented - structural issues
+                | ObjectStoreError::NotSupported { .. }
+                | ObjectStoreError::NotImplemented
+                // Configuration errors - won't fix themselves
+                | ObjectStoreError::UnknownConfigurationKey { .. }
+                // Invalid path - structural issue
+                | ObjectStoreError::InvalidPath { .. }
+        )
+    }
 
-        // 400 Bad Request - malformed request won't succeed on retry
-        if error_lower.contains("400") && error_lower.contains("bad request") {
-            return true;
-        }
-
-        // 403 Forbidden - permission issues won't resolve on retry
-        if error_lower.contains("403") || error_lower.contains("forbidden") {
-            return true;
-        }
-
-        // 404 Not Found - resource doesn't exist
-        if error_lower.contains("404") || error_lower.contains("not found") {
-            return true;
-        }
-
-        // 405 Method Not Allowed
-        if error_lower.contains("405") || error_lower.contains("method not allowed") {
-            return true;
-        }
-
-        // 410 Gone - resource permanently deleted
-        if error_lower.contains("410") || error_lower.contains("gone") {
-            return true;
-        }
-
-        // Permission denied patterns
-        if error_lower.contains("permission denied")
-            || error_lower.contains("access denied")
-            || error_lower.contains("not authorized")
-        {
-            return true;
-        }
-
-        false
+    /// Check if a concurrent conflict error (should not retry at Tower level).
+    ///
+    /// Precondition failures are handled internally with table reload.
+    /// Retrying here without reload would cause infinite loops with stale version numbers.
+    fn is_concurrent_conflict_error(error: &ObjectStoreError) -> bool {
+        matches!(
+            error,
+            ObjectStoreError::Precondition { .. } | ObjectStoreError::AlreadyExists { .. }
+        )
     }
 }
 
@@ -392,33 +384,31 @@ impl RetryLogic for DeltaLakeRetryLogic {
     type Response = DeltaLakeResponse;
 
     fn is_retriable_error(&self, error: &Self::Error) -> bool {
-        let error_str = error.to_string();
-
-        // Don't retry FAILED_PRECONDITION at Tower level - these are concurrent write
-        // conflicts that are handled internally with table reload. Retrying here without
-        // reload would cause infinite loops with stale version numbers.
-        if error_str.contains("FAILED_PRECONDITION")
-            || error_str.contains("precondition")
-            || error_str.contains("Precondition")
-        {
-            return false;
-        }
-
         match error {
-            // Retry on storage/network errors unless it's a non-retriable client error
-            // (FAILED_PRECONDITION is already excluded above)
-            DeltaTableError::ObjectStore { source: _ } => {
-                !Self::is_non_retriable_gcs_error(&error_str)
+            // ObjectStore errors - use structured matching
+            DeltaTableError::ObjectStore { source } => {
+                // Don't retry concurrent conflicts - handled internally with table reload
+                if Self::is_concurrent_conflict_error(source) {
+                    return false;
+                }
+                // Don't retry permanent client errors
+                !Self::is_non_retriable_object_store_error(source)
             }
-            DeltaTableError::Io { source: _ } => true,
 
-            // Don't retry schema/data errors
-            DeltaTableError::Arrow { source: _ } => false,
-            DeltaTableError::Kernel { source: _ } => false,
-            DeltaTableError::InvalidData { violations: _ } => false,
+            // IO errors are typically transient - retry
+            DeltaTableError::Io { .. } => true,
 
-            // Generic errors - retry unless it's a non-retriable GCS pattern
-            _ => !Self::is_non_retriable_gcs_error(&error_str),
+            // Don't retry schema/data errors - they require code changes to fix
+            DeltaTableError::Arrow { .. }
+            | DeltaTableError::Kernel { .. }
+            | DeltaTableError::InvalidData { .. }
+            | DeltaTableError::SchemaMismatch { .. } => false,
+
+            // Transaction errors - don't retry at Tower level (handled internally)
+            DeltaTableError::Transaction { .. } => false,
+
+            // Other errors - default to retriable (network issues, timeouts, etc.)
+            _ => true,
         }
     }
 }
