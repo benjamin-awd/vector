@@ -33,7 +33,7 @@ use crate::{
     sinks::{
         aws_s3::config::default_filename_time_format,
         s3_common::config::{S3Options, S3ServerSideEncryption},
-        util::{BatchConfig, Compression, TowerRequestConfig},
+        util::{BatchConfig, Compression, TowerRequestConfig, encoding::SinkEncoderConfig},
     },
     test_util::{
         components::{
@@ -433,6 +433,7 @@ async fn s3_flush_on_exhaustion() {
             options: S3Options::default(),
             region: RegionOrEndpoint::with_both("us-east-1", s3_address()),
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
+            batch_encoding: Default::default(),
             compression: Compression::None,
             batch,
             request: TowerRequestConfig::default(),
@@ -490,6 +491,89 @@ async fn s3_flush_on_exhaustion() {
     assert_eq!(lines, response_lines); // if all events are received, and lines.len() < batch size, then a flush was performed.
 }
 
+#[tokio::test]
+async fn s3_insert_message_into_parquet() {
+    use arrow::array::{Array, StringArray};
+    use vector_lib::codecs::encoding::{
+        BatchEncodingConfig, BatchSerializerConfig, FieldConfig, FieldType, SchemaConfig,
+    };
+
+    let cx = SinkContext::default();
+
+    let bucket = uuid::Uuid::new_v4().to_string();
+    let event_count = 10;
+
+    create_bucket(&bucket, false).await;
+
+    let mut config = config(&bucket, 1000000);
+    config.key_prefix = "parquet-test/".to_string();
+    config.encoding.batch = BatchEncodingConfig {
+        serializer: Some(BatchSerializerConfig::Parquet(Default::default())),
+        schema: Some(SchemaConfig {
+            fields: vec![FieldConfig {
+                name: "message".into(),
+                field_type: FieldType::String,
+                nullable: true,
+            }],
+        }),
+    };
+    config.compression = Compression::None;
+
+    let prefix = config.key_prefix.clone();
+    let service = config.create_service(&cx.globals.proxy).await.unwrap();
+    let sink = config.build_processor(service, cx).unwrap();
+
+    let (lines, events, receiver) = make_events_batch(100, event_count);
+    run_and_assert_sink_compliance(sink, events, &AWS_SINK_TAGS).await;
+    assert_eq!(receiver.await, BatchStatus::Delivered);
+
+    let keys = get_keys(&bucket, prefix).await;
+    assert_eq!(keys.len(), 1);
+    assert!(
+        keys[0].ends_with(".parquet"),
+        "Expected .parquet extension, got: {}",
+        keys[0]
+    );
+
+    let obj = get_object(&bucket, keys[0].clone()).await;
+    let body = bytes::Bytes::from(obj.body.collect().await.unwrap().to_vec());
+
+    // Validate Parquet magic bytes
+    assert!(body.len() > 8, "Parquet file too small");
+    assert_eq!(&body[..4], b"PAR1", "Missing Parquet header magic");
+    assert_eq!(
+        &body[body.len() - 4..],
+        b"PAR1",
+        "Missing Parquet footer magic"
+    );
+
+    // Read back with parquet reader and validate contents
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(body, 1024)
+        .expect("Failed to create Parquet reader");
+
+    let batches: Vec<_> = reader
+        .collect::<Result<_, _>>()
+        .expect("Failed to read Parquet batches");
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, event_count);
+
+    // Validate the message column values match what we sent
+    let mut messages: Vec<String> = Vec::new();
+    for batch in &batches {
+        let col = batch
+            .column_by_name("message")
+            .expect("Missing 'message' column");
+        let string_array = col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("'message' column is not StringArray");
+        for i in 0..string_array.len() {
+            messages.push(string_array.value(i).to_string());
+        }
+    }
+    assert_eq!(lines, messages);
+}
+
 async fn client() -> S3Client {
     let auth = AwsAuthentication::test_auth();
     let region = RegionOrEndpoint::with_both("us-east-1", s3_address());
@@ -525,7 +609,10 @@ fn config(bucket: &str, batch_size: usize) -> S3SinkConfig {
         filename_extension: None,
         options: S3Options::default(),
         region: RegionOrEndpoint::with_both("us-east-1", s3_address()),
-        encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
+        encoding: SinkEncoderConfig {
+            encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
+            batch: Default::default(),
+        },
         compression: Compression::None,
         batch,
         request: TowerRequestConfig::default(),

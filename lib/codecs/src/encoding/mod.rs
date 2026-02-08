@@ -13,7 +13,8 @@ pub use config::{EncodingConfig, EncodingConfigWithFraming, SinkType};
 pub use encoder::{BatchEncoder, BatchSerializer, Encoder, EncoderKind};
 #[cfg(feature = "arrow")]
 pub use format::{
-    ArrowEncodingError, ArrowStreamSerializer, ArrowStreamSerializerConfig, SchemaProvider,
+    ArrowEncodingError, ArrowStreamSerializer, ArrowStreamSerializerConfig, FieldConfig, FieldType,
+    ParquetCompression, ParquetSerializer, ParquetSerializerConfig, SchemaConfig, SchemaProvider,
 };
 pub use format::{
     AvroSerializer, AvroSerializerConfig, AvroSerializerOptions, CefSerializer,
@@ -36,7 +37,7 @@ pub use framing::{
     VarintLengthDelimitedEncoderConfig,
 };
 #[cfg(feature = "arrow")]
-pub use serializer::BatchSerializerConfig;
+pub use serializer::{BatchEncodingConfig, BatchSerializerConfig};
 pub use serializer::{Serializer, SerializerConfig};
 pub use transformer::{TimestampFormat, Transformer};
 

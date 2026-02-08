@@ -108,9 +108,8 @@ impl ArrowStreamSerializer {
                 .fields()
                 .iter()
                 .map(|f| make_field_nullable(f))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| vector_common::Error::from(e.to_string()))?
-                .into();
+                .collect::<Result<_, _>>()
+                .map_err(|e: ArrowEncodingError| vector_common::Error::from(e.to_string()))?;
             Schema::new_with_metadata(nullable_fields, schema.metadata().clone())
         } else {
             schema
@@ -150,6 +149,13 @@ pub enum ArrowEncodingError {
     /// Failed to write Arrow IPC data
     #[snafu(display("Failed to write Arrow IPC data: {}", source))]
     IpcWrite {
+        /// The underlying Arrow error
+        source: arrow::error::ArrowError,
+    },
+
+    /// Failed to write Parquet data
+    #[snafu(display("Failed to write Parquet data: {}", source))]
+    ParquetWrite {
         /// The underlying Arrow error
         source: arrow::error::ArrowError,
     },
@@ -244,7 +250,7 @@ pub fn encode_events_to_arrow_ipc_stream(
 }
 
 /// Recursively makes a Field and all its nested fields nullable
-fn make_field_nullable(field: &Field) -> Result<Field, ArrowEncodingError> {
+pub(crate) fn make_field_nullable(field: &Field) -> Result<Field, ArrowEncodingError> {
     let new_data_type = match field.data_type() {
         DataType::List(inner_field) => DataType::List(make_field_nullable(inner_field)?.into()),
         DataType::Struct(fields) => DataType::Struct(
@@ -295,7 +301,7 @@ fn make_field_nullable(field: &Field) -> Result<Field, ArrowEncodingError> {
 }
 
 /// Build an Arrow RecordBatch from a slice of events using the provided schema.
-fn build_record_batch(
+pub(crate) fn build_record_batch(
     schema: SchemaRef,
     events: &[Event],
 ) -> Result<RecordBatch, ArrowEncodingError> {

@@ -12,14 +12,14 @@ use tower::ServiceBuilder;
 use uuid::Uuid;
 use vector_lib::{
     TimeZone,
-    codecs::encoding::Framer,
+    codecs::EncoderKind,
     configurable::configurable_component,
     event::{EventFinalizers, Finalizable},
     request_metadata::RequestMetadata,
 };
 
 use crate::{
-    codecs::{Encoder, EncodingConfigWithFraming, SinkType, Transformer},
+    codecs::Transformer,
     config::{AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext},
     event::Event,
     gcp::{GcpAuthConfig, GcpAuthenticator, Scope},
@@ -37,9 +37,9 @@ use crate::{
         },
         util::{
             BulkSizeBasedDefaultBatchSettings, Compression, RequestBuilder, ServiceBuilderExt,
-            TowerRequestConfig, batch::BatchConfig, metadata::RequestMetadataBuilder,
-            partitioner::KeyPartitioner, request_builder::EncodeResult,
-            service::TowerRequestConfigDefaults, timezone_to_offset,
+            TowerRequestConfig, batch::BatchConfig, encoding::SinkEncoderConfig,
+            metadata::RequestMetadataBuilder, partitioner::KeyPartitioner,
+            request_builder::EncodeResult, service::TowerRequestConfigDefaults, timezone_to_offset,
         },
     },
     template::{Template, TemplateParseError},
@@ -149,7 +149,7 @@ pub struct GcsSinkConfig {
     filename_extension: Option<String>,
 
     #[serde(flatten)]
-    encoding: EncodingConfigWithFraming,
+    encoding: SinkEncoderConfig,
 
     /// Compression configuration.
     ///
@@ -210,7 +210,7 @@ fn default_time_format() -> String {
 }
 
 #[cfg(test)]
-fn default_config(encoding: EncodingConfigWithFraming) -> GcsSinkConfig {
+fn default_config(encoding: crate::codecs::EncodingConfigWithFraming) -> GcsSinkConfig {
     GcsSinkConfig {
         bucket: Default::default(),
         acl: Default::default(),
@@ -221,7 +221,10 @@ fn default_config(encoding: EncodingConfigWithFraming) -> GcsSinkConfig {
         filename_append_uuid: true,
         filename_extension: Default::default(),
         content_type: Default::default(),
-        encoding,
+        encoding: SinkEncoderConfig {
+            encoding,
+            batch: Default::default(),
+        },
         compression: Compression::gzip_default(),
         batch: Default::default(),
         endpoint: Default::default(),
@@ -266,7 +269,7 @@ impl SinkConfig for GcsSinkConfig {
     }
 
     fn input(&self) -> Input {
-        Input::new(self.encoding.config().1.input_type() & DataType::Log)
+        Input::new(self.encoding.input_type() & DataType::Log)
     }
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
@@ -323,7 +326,7 @@ struct RequestSettings {
     extension: String,
     time_format: String,
     append_uuid: bool,
-    encoder: (Transformer, Encoder<Framer>),
+    encoder: (Transformer, EncoderKind),
     compression: Compression,
     tz_offset: Option<FixedOffset>,
 }
@@ -331,7 +334,7 @@ struct RequestSettings {
 impl RequestBuilder<(String, Vec<Event>)> for RequestSettings {
     type Metadata = (String, EventFinalizers);
     type Events = Vec<Event>;
-    type Encoder = (Transformer, Encoder<Framer>);
+    type Encoder = (Transformer, EncoderKind);
     type Payload = Bytes;
     type Request = GcsRequest;
     type Error = io::Error;
@@ -401,17 +404,18 @@ impl RequestBuilder<(String, Vec<Event>)> for RequestSettings {
 impl RequestSettings {
     fn new(config: &GcsSinkConfig, cx: SinkContext) -> crate::Result<Self> {
         let transformer = config.encoding.transformer();
-        let (framer, serializer) = config.encoding.build(SinkType::MessageBased)?;
-        let encoder = Encoder::<Framer>::new(framer, serializer);
+
+        let resolved = config.encoding.resolve_encoder(config.compression)?;
+
         let acl = config
             .acl
             .map(|acl| HeaderValue::from_str(&to_string(acl)).unwrap());
         let content_type_str = config
             .content_type
             .as_deref()
-            .unwrap_or_else(|| encoder.content_type());
+            .unwrap_or(resolved.content_type);
         let content_type = HeaderValue::from_str(content_type_str)?;
-        let content_encoding = config
+        let content_encoding = resolved
             .compression
             .content_encoding()
             .map(|ce| HeaderValue::from_str(&to_string(ce)).unwrap());
@@ -430,7 +434,8 @@ impl RequestSettings {
         let extension = config
             .filename_extension
             .clone()
-            .unwrap_or_else(|| config.compression.extension().into());
+            .or(resolved.extension)
+            .unwrap_or_else(|| resolved.compression.extension().into());
         let time_format = config.filename_time_format.clone();
         let append_uuid = config.filename_append_uuid;
         let offset = config
@@ -447,8 +452,8 @@ impl RequestSettings {
             extension,
             time_format,
             append_uuid,
-            compression: config.compression,
-            encoder: (transformer, encoder),
+            compression: resolved.compression,
+            encoder: (transformer, resolved.encoder_kind),
             tz_offset: offset,
         })
     }

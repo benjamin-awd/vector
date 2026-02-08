@@ -301,7 +301,7 @@ azure_core = { version = "0.30", features = ["reqwest", "hmac_openssl"], optiona
 azure_storage_blob = { version = "0.7", optional = true }
 
 # OpenDAL
-opendal = { version = "0.54", default-features = false, features = ["services-webhdfs"], optional = true }
+opendal = { version = "0.54", default-features = false, optional = true }
 
 # Tower
 tower = { version = "0.5.2", default-features = false, features = ["buffer", "limit", "retry", "timeout", "util", "balance", "discover"] }
@@ -471,6 +471,7 @@ criterion = { version = "0.7.0", features = ["html_reports", "async_tokio"] }
 itertools.workspace = true
 libc.workspace = true
 mock_instant.workspace = true
+parquet = { version = "56.2.0", default-features = false, features = ["arrow"] }
 proptest.workspace = true
 quickcheck = "1.0.3"
 reqwest.workspace = true
@@ -847,7 +848,7 @@ sinks-aws_cloudwatch_logs = ["aws-core", "dep:aws-sdk-cloudwatchlogs", "dep:aws-
 sinks-aws_cloudwatch_metrics = ["aws-core", "dep:aws-sdk-cloudwatch"]
 sinks-aws_kinesis_firehose = ["aws-core", "dep:aws-sdk-firehose"]
 sinks-aws_kinesis_streams = ["aws-core", "dep:aws-sdk-kinesis"]
-sinks-aws_s3 = ["dep:base64", "dep:md-5", "aws-core", "dep:aws-sdk-s3"]
+sinks-aws_s3 = ["dep:base64", "dep:md-5", "aws-core", "dep:aws-sdk-s3", "codecs-arrow"]
 sinks-aws_sqs = ["aws-core", "dep:aws-sdk-sqs"]
 sinks-aws_sns = ["aws-core", "dep:aws-sdk-sns"]
 sinks-axiom = ["sinks-http"]
@@ -865,7 +866,7 @@ sinks-datadog_traces = ["protobuf-build", "dep:prost", "dep:rmpv", "dep:rmp-serd
 sinks-doris = ["sqlx/mysql"]
 sinks-elasticsearch = ["transforms-metric_to_log"]
 sinks-file = ["dep:async-compression"]
-sinks-gcp = ["sinks-gcp-chronicle", "dep:base64", "gcp"]
+sinks-gcp = ["sinks-gcp-chronicle", "dep:base64", "gcp", "codecs-arrow"]
 sinks-gcp-chronicle = ["gcp"]
 sinks-greptimedb_metrics = ["dep:greptimedb-ingester"]
 sinks-greptimedb_logs = ["dep:greptimedb-ingester"]
@@ -895,7 +896,7 @@ sinks-utils-udp = []
 sinks-vector = ["sinks-utils-udp", "dep:tonic", "protobuf-build", "dep:prost"]
 sinks-websocket = ["dep:tokio-tungstenite"]
 sinks-websocket-server = ["dep:tokio-tungstenite", "sources-utils-http-auth", "sources-utils-http-error", "sources-utils-http-prelude"]
-sinks-webhdfs = ["dep:opendal"]
+sinks-webhdfs = ["dep:opendal", "opendal/services-webhdfs"]
 
 # Identifies that the build is a nightly build
 nightly = []

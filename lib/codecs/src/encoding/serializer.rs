@@ -5,7 +5,7 @@ use vector_config::configurable_component;
 use vector_core::{config::DataType, event::Event, schema};
 
 #[cfg(feature = "arrow")]
-use super::format::{ArrowStreamSerializer, ArrowStreamSerializerConfig};
+use super::format::{ArrowStreamSerializer, ArrowStreamSerializerConfig, ParquetSerializerConfig};
 #[cfg(feature = "opentelemetry")]
 use super::format::{OtlpSerializer, OtlpSerializerConfig};
 #[cfg(feature = "syslog")]
@@ -160,25 +160,71 @@ pub enum BatchSerializerConfig {
     #[cfg(feature = "arrow")]
     #[serde(rename = "arrow_stream")]
     ArrowStream(ArrowStreamSerializerConfig),
+
+    /// Encodes events as [Apache Parquet][apache_parquet] files.
+    ///
+    /// Produces complete Parquet files with footer from batches of events.
+    /// Parquet handles compression internally at the column-chunk level.
+    ///
+    /// [apache_parquet]: https://parquet.apache.org/
+    #[cfg(feature = "arrow")]
+    Parquet(ParquetSerializerConfig),
 }
 
 #[cfg(feature = "arrow")]
 impl BatchSerializerConfig {
-    /// Build the `ArrowStreamSerializer` from this configuration.
+    /// Build the `BatchSerializer` from this configuration.
     pub fn build(
         &self,
-    ) -> Result<ArrowStreamSerializer, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    ) -> Result<super::encoder::BatchSerializer, Box<dyn std::error::Error + Send + Sync + 'static>>
+    {
         match self {
             BatchSerializerConfig::ArrowStream(arrow_config) => {
-                ArrowStreamSerializer::new(arrow_config.clone())
+                Ok(super::encoder::BatchSerializer::Arrow(
+                    ArrowStreamSerializer::new(arrow_config.clone())?,
+                ))
+            }
+            BatchSerializerConfig::Parquet(parquet_config) => {
+                Ok(super::encoder::BatchSerializer::Parquet(Box::new(
+                    super::format::ParquetSerializer::new(parquet_config.clone())?,
+                )))
             }
         }
+    }
+
+    /// Inject a schema from a [`SchemaConfig`] and build the `BatchSerializer`.
+    ///
+    /// This is a convenience method for sinks that define the schema via
+    /// user-provided [`FieldConfig`] entries (e.g. S3, GCS) rather than
+    /// fetching it from a remote data store.
+    pub fn build_with_schema(
+        &self,
+        schema_config: &super::format::SchemaConfig,
+    ) -> Result<super::encoder::BatchSerializer, Box<dyn std::error::Error + Send + Sync + 'static>>
+    {
+        let schema = schema_config.to_arrow_schema();
+
+        let resolved = match self {
+            BatchSerializerConfig::ArrowStream(arrow_config) => {
+                let mut config = arrow_config.clone();
+                config.schema = Some(schema.as_ref().clone());
+                BatchSerializerConfig::ArrowStream(config)
+            }
+            BatchSerializerConfig::Parquet(parquet_config) => {
+                let mut config = parquet_config.clone();
+                config.schema = Some(schema.as_ref().clone());
+                BatchSerializerConfig::Parquet(config)
+            }
+        };
+
+        resolved.build()
     }
 
     /// The data type of events that are accepted by this batch serializer.
     pub fn input_type(&self) -> DataType {
         match self {
             BatchSerializerConfig::ArrowStream(arrow_config) => arrow_config.input_type(),
+            BatchSerializerConfig::Parquet(_) => DataType::Log,
         }
     }
 
@@ -186,8 +232,42 @@ impl BatchSerializerConfig {
     pub fn schema_requirement(&self) -> schema::Requirement {
         match self {
             BatchSerializerConfig::ArrowStream(arrow_config) => arrow_config.schema_requirement(),
+            BatchSerializerConfig::Parquet(_) => schema::Requirement::empty(),
         }
     }
+
+    /// The file extension for this batch encoding format.
+    pub fn file_extension(&self) -> &'static str {
+        match self {
+            BatchSerializerConfig::ArrowStream(_) => "arrow",
+            BatchSerializerConfig::Parquet(_) => "parquet",
+        }
+    }
+}
+
+/// Common configuration for batch encoding with Arrow/Parquet formats.
+///
+/// Shared across file-based sinks (S3, GCS, etc.) that support batch_config output.
+/// Flatten this into sink configs with `#[serde(flatten)]`.
+#[cfg(feature = "arrow")]
+#[configurable_component]
+#[derive(Clone, Debug, Default)]
+pub struct BatchEncodingConfig {
+    /// Batch encoding configuration for batch formats (e.g., Parquet).
+    ///
+    /// When set, events are encoded as a single batch using the specified batch
+    /// format instead of the standard framed encoding. Requires `schema` to
+    /// be configured.
+    #[configurable(derived)]
+    #[serde(default, rename = "batch_encoding")]
+    pub serializer: Option<BatchSerializerConfig>,
+
+    /// Schema configuration for batch encoding output (Parquet, Arrow).
+    ///
+    /// Required when `batch_encoding` is set.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub schema: Option<super::format::SchemaConfig>,
 }
 
 impl From<AvroSerializerConfig> for SerializerConfig {

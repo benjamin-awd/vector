@@ -2,18 +2,16 @@ use aws_sdk_s3::Client as S3Client;
 use tower::ServiceBuilder;
 use vector_lib::{
     TimeZone,
-    codecs::{
-        TextSerializerConfig,
-        encoding::{Framer, FramingConfig},
-    },
+    codecs::{TextSerializerConfig, encoding::FramingConfig},
     configurable::configurable_component,
     sink::VectorSink,
 };
 
+use crate::config::DataType;
+
 use super::sink::S3RequestOptions;
 use crate::{
     aws::{AwsAuthentication, RegionOrEndpoint},
-    codecs::{Encoder, EncodingConfigWithFraming, SinkType},
     config::{AcknowledgementsConfig, GenerateConfig, Input, ProxyConfig, SinkConfig, SinkContext},
     sinks::{
         Healthcheck,
@@ -26,7 +24,7 @@ use crate::{
         },
         util::{
             BatchConfig, BulkSizeBasedDefaultBatchSettings, Compression, ServiceBuilderExt,
-            TowerRequestConfig, timezone_to_offset,
+            TowerRequestConfig, encoding::SinkEncoderConfig, timezone_to_offset,
         },
     },
     template::Template,
@@ -103,7 +101,7 @@ pub struct S3SinkConfig {
     pub region: RegionOrEndpoint,
 
     #[serde(flatten)]
-    pub encoding: EncodingConfigWithFraming,
+    pub encoding: SinkEncoderConfig,
 
     /// Compression configuration.
     ///
@@ -175,7 +173,10 @@ impl GenerateConfig for S3SinkConfig {
             filename_extension: None,
             options: S3Options::default(),
             region: RegionOrEndpoint::default(),
-            encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
+            encoding: SinkEncoderConfig {
+                encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
+                batch: Default::default(),
+            },
             compression: Compression::gzip_default(),
             batch: BatchConfig::default(),
             request: TowerRequestConfig::default(),
@@ -201,7 +202,7 @@ impl SinkConfig for S3SinkConfig {
     }
 
     fn input(&self) -> Input {
-        Input::new(self.encoding.config().1.input_type())
+        Input::new(self.encoding.input_type() & DataType::Log)
     }
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
@@ -246,17 +247,19 @@ impl S3SinkConfig {
         let partitioner = S3KeyPartitioner::new(key_prefix, ssekms_key_id, None);
 
         let transformer = self.encoding.transformer();
-        let (framer, serializer) = self.encoding.build(SinkType::MessageBased)?;
-        let encoder = Encoder::<Framer>::new(framer, serializer);
+
+        let resolved = self.encoding.resolve_encoder(self.compression)?;
+
+        let filename_extension = self.filename_extension.clone().or(resolved.extension);
 
         let request_options = S3RequestOptions {
             bucket: self.bucket.clone(),
             api_options: self.options.clone(),
-            filename_extension: self.filename_extension.clone(),
+            filename_extension,
             filename_time_format: self.filename_time_format.clone(),
             filename_append_uuid: self.filename_append_uuid,
-            encoder: (transformer, encoder),
-            compression: self.compression,
+            encoder: (transformer, resolved.encoder_kind),
+            compression: resolved.compression,
             filename_tz_offset: offset,
         };
 

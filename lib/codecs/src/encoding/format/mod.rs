@@ -16,6 +16,8 @@ mod native;
 mod native_json;
 #[cfg(feature = "opentelemetry")]
 mod otlp;
+#[cfg(feature = "arrow")]
+mod parquet;
 mod protobuf;
 mod raw_message;
 #[cfg(feature = "syslog")]
@@ -38,6 +40,11 @@ pub use native::{NativeSerializer, NativeSerializerConfig};
 pub use native_json::{NativeJsonSerializer, NativeJsonSerializerConfig};
 #[cfg(feature = "opentelemetry")]
 pub use otlp::{OtlpSerializer, OtlpSerializerConfig};
+#[cfg(feature = "arrow")]
+pub use parquet::{
+    FieldConfig, FieldType, ParquetCompression, ParquetSerializer, ParquetSerializerConfig,
+    SchemaConfig,
+};
 pub use protobuf::{ProtobufSerializer, ProtobufSerializerConfig, ProtobufSerializerOptions};
 pub use raw_message::{RawMessageSerializer, RawMessageSerializerConfig};
 #[cfg(feature = "syslog")]

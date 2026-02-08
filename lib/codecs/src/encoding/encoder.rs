@@ -5,6 +5,8 @@ use vector_core::event::Event;
 
 #[cfg(feature = "arrow")]
 use crate::encoding::ArrowStreamSerializer;
+#[cfg(feature = "arrow")]
+use crate::encoding::ParquetSerializer;
 use crate::{
     encoding::{Error, Framer, Serializer},
     internal_events::{EncoderFramingError, EncoderSerializeError},
@@ -16,6 +18,9 @@ pub enum BatchSerializer {
     /// Arrow IPC stream format serializer.
     #[cfg(feature = "arrow")]
     Arrow(ArrowStreamSerializer),
+    /// Parquet file format serializer.
+    #[cfg(feature = "arrow")]
+    Parquet(Box<ParquetSerializer>),
 }
 
 /// An encoder that encodes batches of events.
@@ -40,6 +45,7 @@ impl BatchEncoder {
     pub const fn content_type(&self) -> &'static str {
         match &self.serializer {
             BatchSerializer::Arrow(_) => "application/vnd.apache.arrow.stream",
+            BatchSerializer::Parquet(_) => "application/vnd.apache.parquet",
         }
     }
 }
@@ -63,6 +69,18 @@ impl tokio_util::codec::Encoder<Vec<Event>> for BatchEncoder {
                     }
                 })
             }
+            #[cfg(feature = "arrow")]
+            BatchSerializer::Parquet(serializer) => {
+                serializer.encode(events, buffer).map_err(|err| {
+                    use crate::encoding::ArrowEncodingError;
+                    match err {
+                        ArrowEncodingError::NullConstraint { .. } => {
+                            Error::SchemaConstraintViolation(Box::new(err))
+                        }
+                        _ => Error::SerializingError(Box::new(err)),
+                    }
+                })
+            }
             _ => unreachable!("BatchSerializer cannot be constructed without encode()"),
         }
     }
@@ -75,7 +93,7 @@ pub enum EncoderKind {
     Framed(Box<Encoder<Framer>>),
     /// Encodes events in batches without framing
     #[cfg(feature = "arrow")]
-    Batch(BatchEncoder),
+    Batch(Box<BatchEncoder>),
 }
 
 #[derive(Debug, Clone)]

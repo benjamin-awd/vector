@@ -5,14 +5,123 @@ use itertools::{Itertools, Position};
 use tokio_util::codec::Encoder as _;
 use vector_lib::{
     EstimatedJsonEncodedSizeOf,
-    codecs::{Transformer, encoding::Framer, internal_events::EncoderWriteError},
+    codecs::{EncoderKind, Transformer, encoding::Framer, internal_events::EncoderWriteError},
     config::telemetry,
     request_metadata::GroupedCountByteSize,
 };
 
 use crate::event::Event;
 #[cfg(feature = "codecs-arrow")]
-use vector_lib::codecs::internal_events::EncoderNullConstraintError;
+use vector_lib::{
+    codecs::{
+        BatchEncoder, encoding::BatchEncodingConfig, encoding::BatchSerializerConfig,
+        encoding::format::SchemaConfig, internal_events::EncoderNullConstraintError,
+    },
+    configurable::configurable_component,
+};
+
+use crate::{
+    codecs::{EncodingConfigWithFraming, SinkType},
+    sinks::util::Compression,
+};
+
+/// A sink encoder built from configuration, bundling the encoder kind,
+/// content type, file extension, and effective compression.
+#[cfg(feature = "codecs-arrow")]
+pub struct SinkEncoder {
+    pub encoder_kind: EncoderKind,
+    pub content_type: &'static str,
+    pub extension: Option<String>,
+    pub compression: Compression,
+}
+
+#[cfg(feature = "codecs-arrow")]
+impl SinkEncoder {
+    /// Build a framed encoder for per-event encoding (e.g. JSON, text).
+    pub fn framed(
+        encoding: &EncodingConfigWithFraming,
+        compression: Compression,
+    ) -> crate::Result<Self> {
+        let (framer, serializer) = encoding.build(SinkType::MessageBased)?;
+        let encoder = crate::codecs::Encoder::<Framer>::new(framer, serializer);
+        let content_type = encoder.content_type();
+        Ok(Self {
+            encoder_kind: EncoderKind::Framed(Box::new(encoder)),
+            content_type,
+            extension: None,
+            compression,
+        })
+    }
+
+    /// Build a batch encoder (Arrow/Parquet). Compression is forced to `None`
+    /// because batch formats handle compression internally.
+    pub fn batch(
+        serializer_config: &BatchSerializerConfig,
+        schema_config: &SchemaConfig,
+    ) -> crate::Result<Self> {
+        let batch_serializer = serializer_config.build_with_schema(schema_config)?;
+        let batch_encoder = BatchEncoder::new(batch_serializer);
+        let content_type = batch_encoder.content_type();
+        let extension = serializer_config.file_extension().to_string();
+        Ok(Self {
+            encoder_kind: EncoderKind::Batch(Box::new(batch_encoder)),
+            content_type,
+            extension: Some(extension),
+            compression: Compression::None,
+        })
+    }
+}
+
+/// Unified encoding configuration for file-based sinks that support both
+/// framed (per-event) and batch (Arrow/Parquet) encoding.
+///
+/// Flatten this into sink configs with `#[serde(flatten)]`.
+#[cfg(feature = "codecs-arrow")]
+#[configurable_component]
+#[derive(Clone, Debug)]
+pub struct SinkEncoderConfig {
+    #[serde(flatten)]
+    pub encoding: EncodingConfigWithFraming,
+
+    #[serde(flatten)]
+    pub batch: BatchEncodingConfig,
+}
+
+#[cfg(feature = "codecs-arrow")]
+impl SinkEncoderConfig {
+    /// The data type accepted by the configured encoder.
+    ///
+    /// Returns the batch serializer's input type if configured,
+    /// otherwise falls back to the framed serializer's input type.
+    pub fn input_type(&self) -> vector_lib::config::DataType {
+        self.batch
+            .serializer
+            .as_ref()
+            .map_or_else(|| self.encoding.config().1.input_type(), |s| s.input_type())
+    }
+
+    /// Build a `Transformer` that applies encoding rules to events before serialization.
+    pub fn transformer(&self) -> Transformer {
+        self.encoding.transformer()
+    }
+
+    /// Build the appropriate encoder, resolving batch vs framed encoding.
+    ///
+    /// When `batch_encoding` is configured, builds a batch encoder (Arrow/Parquet).
+    /// Otherwise falls back to the standard framed encoder.
+    pub fn resolve_encoder(&self, compression: Compression) -> crate::Result<SinkEncoder> {
+        let Some(serializer_config) = &self.batch.serializer else {
+            return SinkEncoder::framed(&self.encoding, compression);
+        };
+
+        let schema_config = self
+            .batch
+            .schema
+            .as_ref()
+            .ok_or("schema is required when batch_encoding is set")?;
+        SinkEncoder::batch(serializer_config, schema_config)
+    }
+}
 
 pub trait Encoder<T> {
     /// Encodes the input into the provided writer.
@@ -142,7 +251,7 @@ impl Encoder<Vec<Event>> for (Transformer, vector_lib::codecs::BatchEncoder) {
     }
 }
 
-impl Encoder<Vec<Event>> for (Transformer, vector_lib::codecs::EncoderKind) {
+impl Encoder<Vec<Event>> for (Transformer, EncoderKind) {
     fn encode_input(
         &self,
         events: Vec<Event>,
@@ -150,12 +259,12 @@ impl Encoder<Vec<Event>> for (Transformer, vector_lib::codecs::EncoderKind) {
     ) -> io::Result<(usize, GroupedCountByteSize)> {
         // Delegate to the specific encoder implementation
         match &self.1 {
-            vector_lib::codecs::EncoderKind::Framed(encoder) => {
+            EncoderKind::Framed(encoder) => {
                 (self.0.clone(), *encoder.clone()).encode_input(events, writer)
             }
             #[cfg(feature = "codecs-arrow")]
-            vector_lib::codecs::EncoderKind::Batch(encoder) => {
-                (self.0.clone(), encoder.clone()).encode_input(events, writer)
+            EncoderKind::Batch(encoder) => {
+                (self.0.clone(), *encoder.clone()).encode_input(events, writer)
             }
         }
     }
