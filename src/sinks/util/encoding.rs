@@ -14,8 +14,8 @@ use crate::event::Event;
 #[cfg(feature = "codecs-arrow")]
 use vector_lib::{
     codecs::{
-        BatchEncoder, encoding::BatchEncodingConfig, encoding::BatchSerializerConfig,
-        encoding::format::SchemaConfig, internal_events::EncoderNullConstraintError,
+        BatchEncoder, encoding::BatchSerializerConfig, encoding::format::SchemaConfig,
+        internal_events::EncoderNullConstraintError,
     },
     configurable::configurable_component,
 };
@@ -72,10 +72,15 @@ impl SinkEncoder {
     }
 }
 
+/// Build the appropriate encoder, resolving batch vs framed encoding.
+///
 /// Unified encoding configuration for file-based sinks that support both
 /// framed (per-event) and batch (Arrow/Parquet) encoding.
 ///
 /// Flatten this into sink configs with `#[serde(flatten)]`.
+///
+/// **Important:** The parent sink config must NOT have `#[serde(deny_unknown_fields)]`,
+/// as serde does not support `deny_unknown_fields` combined with `flatten`.
 #[cfg(feature = "codecs-arrow")]
 #[configurable_component]
 #[derive(Clone, Debug)]
@@ -83,19 +88,28 @@ pub struct SinkEncoderConfig {
     #[serde(flatten)]
     pub encoding: EncodingConfigWithFraming,
 
-    #[serde(flatten)]
-    pub batch: BatchEncodingConfig,
+    /// Batch encoding configuration for batch formats (e.g., Parquet).
+    ///
+    /// When set, events are encoded as a single batch using the specified batch
+    /// format instead of the standard framed encoding. Requires `schema` to
+    /// be configured.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub batch_encoding: Option<BatchSerializerConfig>,
+
+    /// Schema configuration for batch encoding output (Parquet, Arrow).
+    ///
+    /// Required when `batch_encoding` is set.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub schema: Option<SchemaConfig>,
 }
 
 #[cfg(feature = "codecs-arrow")]
 impl SinkEncoderConfig {
     /// The data type accepted by the configured encoder.
-    ///
-    /// Returns the batch serializer's input type if configured,
-    /// otherwise falls back to the framed serializer's input type.
     pub fn input_type(&self) -> vector_lib::config::DataType {
-        self.batch
-            .serializer
+        self.batch_encoding
             .as_ref()
             .map_or_else(|| self.encoding.config().1.input_type(), |s| s.input_type())
     }
@@ -110,12 +124,11 @@ impl SinkEncoderConfig {
     /// When `batch_encoding` is configured, builds a batch encoder (Arrow/Parquet).
     /// Otherwise falls back to the standard framed encoder.
     pub fn resolve_encoder(&self, compression: Compression) -> crate::Result<SinkEncoder> {
-        let Some(serializer_config) = &self.batch.serializer else {
+        let Some(serializer_config) = &self.batch_encoding else {
             return SinkEncoder::framed(&self.encoding, compression);
         };
 
         let schema_config = self
-            .batch
             .schema
             .as_ref()
             .ok_or("schema is required when batch_encoding is set")?;

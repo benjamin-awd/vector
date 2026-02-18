@@ -37,7 +37,7 @@ pub use framing::{
     VarintLengthDelimitedEncoderConfig,
 };
 #[cfg(feature = "arrow")]
-pub use serializer::{BatchEncodingConfig, BatchSerializerConfig};
+pub use serializer::BatchSerializerConfig;
 pub use serializer::{Serializer, SerializerConfig};
 pub use transformer::{TimestampFormat, Transformer};
 

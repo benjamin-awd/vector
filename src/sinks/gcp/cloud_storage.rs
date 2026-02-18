@@ -66,7 +66,6 @@ impl TowerRequestConfigDefaults for GcsTowerRequestConfigDefaults {
     "Store observability events in GCP Cloud Storage."
 ))]
 #[derive(Clone, Debug)]
-#[serde(deny_unknown_fields)]
 pub struct GcsSinkConfig {
     /// The GCS bucket name.
     #[configurable(metadata(docs::examples = "my-bucket"))]
@@ -223,7 +222,8 @@ fn default_config(encoding: crate::codecs::EncodingConfigWithFraming) -> GcsSink
         content_type: Default::default(),
         encoding: SinkEncoderConfig {
             encoding,
-            batch: Default::default(),
+            batch_encoding: None,
+            schema: None,
         },
         compression: Compression::gzip_default(),
         batch: Default::default(),

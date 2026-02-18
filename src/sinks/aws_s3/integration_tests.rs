@@ -432,8 +432,11 @@ async fn s3_flush_on_exhaustion() {
             filename_extension: None,
             options: S3Options::default(),
             region: RegionOrEndpoint::with_both("us-east-1", s3_address()),
-            encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
-            batch_encoding: Default::default(),
+            encoding: SinkEncoderConfig {
+                encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
+                batch_encoding: None,
+                schema: None,
+            },
             compression: Compression::None,
             batch,
             request: TowerRequestConfig::default(),
@@ -495,7 +498,7 @@ async fn s3_flush_on_exhaustion() {
 async fn s3_insert_message_into_parquet() {
     use arrow::array::{Array, StringArray};
     use vector_lib::codecs::encoding::{
-        BatchEncodingConfig, BatchSerializerConfig, FieldConfig, FieldType, SchemaConfig,
+        BatchSerializerConfig, FieldConfig, FieldType, SchemaConfig,
     };
 
     let cx = SinkContext::default();
@@ -507,16 +510,15 @@ async fn s3_insert_message_into_parquet() {
 
     let mut config = config(&bucket, 1000000);
     config.key_prefix = "parquet-test/".to_string();
-    config.encoding.batch = BatchEncodingConfig {
-        serializer: Some(BatchSerializerConfig::Parquet(Default::default())),
-        schema: Some(SchemaConfig {
-            fields: vec![FieldConfig {
-                name: "message".into(),
-                field_type: FieldType::String,
-                nullable: true,
-            }],
-        }),
-    };
+    config.encoding.batch_encoding =
+        Some(BatchSerializerConfig::Parquet(Default::default()));
+    config.encoding.schema = Some(SchemaConfig {
+        fields: vec![FieldConfig {
+            name: "message".into(),
+            field_type: FieldType::String,
+            nullable: true,
+        }],
+    });
     config.compression = Compression::None;
 
     let prefix = config.key_prefix.clone();
@@ -611,7 +613,8 @@ fn config(bucket: &str, batch_size: usize) -> S3SinkConfig {
         region: RegionOrEndpoint::with_both("us-east-1", s3_address()),
         encoding: SinkEncoderConfig {
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
-            batch: Default::default(),
+            batch_encoding: None,
+            schema: None,
         },
         compression: Compression::None,
         batch,

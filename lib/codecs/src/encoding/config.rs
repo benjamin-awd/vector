@@ -62,7 +62,6 @@ where
 /// Encoding configuration.
 #[configurable_component]
 #[derive(Clone, Debug)]
-#[serde(deny_unknown_fields)]
 pub struct EncodingConfigWithFraming {
     #[configurable(derived)]
     framing: Option<FramingConfig>,

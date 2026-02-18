@@ -37,7 +37,6 @@ use crate::{
     "Store observability events in the AWS S3 object storage system."
 ))]
 #[derive(Clone, Debug)]
-#[serde(deny_unknown_fields)]
 pub struct S3SinkConfig {
     /// The S3 bucket name.
     ///
@@ -175,7 +174,8 @@ impl GenerateConfig for S3SinkConfig {
             region: RegionOrEndpoint::default(),
             encoding: SinkEncoderConfig {
                 encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
-                batch: Default::default(),
+                batch_encoding: None,
+                schema: None,
             },
             compression: Compression::gzip_default(),
             batch: BatchConfig::default(),

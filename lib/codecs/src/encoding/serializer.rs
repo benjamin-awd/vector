@@ -245,31 +245,6 @@ impl BatchSerializerConfig {
     }
 }
 
-/// Common configuration for batch encoding with Arrow/Parquet formats.
-///
-/// Shared across file-based sinks (S3, GCS, etc.) that support batch_config output.
-/// Flatten this into sink configs with `#[serde(flatten)]`.
-#[cfg(feature = "arrow")]
-#[configurable_component]
-#[derive(Clone, Debug, Default)]
-pub struct BatchEncodingConfig {
-    /// Batch encoding configuration for batch formats (e.g., Parquet).
-    ///
-    /// When set, events are encoded as a single batch using the specified batch
-    /// format instead of the standard framed encoding. Requires `schema` to
-    /// be configured.
-    #[configurable(derived)]
-    #[serde(default, rename = "batch_encoding")]
-    pub serializer: Option<BatchSerializerConfig>,
-
-    /// Schema configuration for batch encoding output (Parquet, Arrow).
-    ///
-    /// Required when `batch_encoding` is set.
-    #[configurable(derived)]
-    #[serde(default)]
-    pub schema: Option<super::format::SchemaConfig>,
-}
-
 impl From<AvroSerializerConfig> for SerializerConfig {
     fn from(config: AvroSerializerConfig) -> Self {
         Self::Avro { avro: config.avro }
