@@ -13,6 +13,8 @@ pub mod internal_events;
 mod ready_frames;
 
 pub use decoder_framed_read::DecoderFramedRead;
+#[cfg(feature = "arrow")]
+pub use decoding::{ArrowStreamDeserializer, ArrowStreamDeserializerConfig};
 pub use decoding::{
     BytesDecoder, BytesDecoderConfig, BytesDeserializer, BytesDeserializerConfig,
     CharacterDelimitedDecoder, CharacterDelimitedDecoderConfig, Decoder, DecodingConfig,

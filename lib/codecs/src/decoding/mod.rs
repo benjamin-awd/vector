@@ -13,6 +13,8 @@ use bytes::{Bytes, BytesMut};
 pub use config::DecodingConfig;
 pub use decoder::Decoder;
 pub use error::StreamDecodingError;
+#[cfg(feature = "arrow")]
+pub use format::{ArrowStreamDeserializer, ArrowStreamDeserializerConfig};
 pub use format::{
     BoxedDeserializer, BytesDeserializer, BytesDeserializerConfig, GelfDeserializer,
     GelfDeserializerConfig, GelfDeserializerOptions, InfluxdbDeserializer,
@@ -323,6 +325,15 @@ pub enum DeserializerConfig {
     ///
     /// [vrl]: https://vector.dev/docs/reference/vrl
     Vrl(VrlDeserializerConfig),
+
+    /// Decodes the raw bytes as an [Apache Arrow IPC stream][arrow_ipc].
+    ///
+    /// The Arrow IPC stream format is self-describing (schema embedded in the stream),
+    /// so no additional configuration is needed.
+    ///
+    /// [arrow_ipc]: https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format
+    #[cfg(feature = "arrow")]
+    ArrowStream,
 }
 
 impl From<BytesDeserializerConfig> for DeserializerConfig {
@@ -353,6 +364,13 @@ impl From<GelfDeserializerConfig> for DeserializerConfig {
 impl From<NativeDeserializerConfig> for DeserializerConfig {
     fn from(_: NativeDeserializerConfig) -> Self {
         Self::Native
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl From<ArrowStreamDeserializerConfig> for DeserializerConfig {
+    fn from(_: ArrowStreamDeserializerConfig) -> Self {
+        Self::ArrowStream
     }
 }
 
@@ -392,6 +410,10 @@ impl DeserializerConfig {
             DeserializerConfig::Gelf(config) => Ok(Deserializer::Gelf(config.build())),
             DeserializerConfig::Influxdb(config) => Ok(Deserializer::Influxdb(config.build())),
             DeserializerConfig::Vrl(config) => Ok(Deserializer::Vrl(config.build()?)),
+            #[cfg(feature = "arrow")]
+            DeserializerConfig::ArrowStream => Ok(Deserializer::ArrowStream(
+                ArrowStreamDeserializerConfig.build()?,
+            )),
         }
     }
 
@@ -412,6 +434,8 @@ impl DeserializerConfig {
             #[cfg(feature = "syslog")]
             DeserializerConfig::Syslog(_) => FramingConfig::NewlineDelimited(Default::default()),
             DeserializerConfig::Vrl(_) => FramingConfig::Bytes,
+            #[cfg(feature = "arrow")]
+            DeserializerConfig::ArrowStream => FramingConfig::Bytes,
             DeserializerConfig::Gelf(_) => {
                 FramingConfig::CharacterDelimited(CharacterDelimitedDecoderConfig::new(0))
             }
@@ -445,6 +469,8 @@ impl DeserializerConfig {
             DeserializerConfig::Gelf(config) => config.output_type(),
             DeserializerConfig::Vrl(config) => config.output_type(),
             DeserializerConfig::Influxdb(config) => config.output_type(),
+            #[cfg(feature = "arrow")]
+            DeserializerConfig::ArrowStream => ArrowStreamDeserializerConfig.output_type(),
         }
     }
 
@@ -467,6 +493,10 @@ impl DeserializerConfig {
             DeserializerConfig::Gelf(config) => config.schema_definition(log_namespace),
             DeserializerConfig::Influxdb(config) => config.schema_definition(log_namespace),
             DeserializerConfig::Vrl(config) => config.schema_definition(log_namespace),
+            #[cfg(feature = "arrow")]
+            DeserializerConfig::ArrowStream => {
+                ArrowStreamDeserializerConfig.schema_definition(log_namespace)
+            }
         }
     }
 
@@ -492,6 +522,8 @@ impl DeserializerConfig {
             (DeserializerConfig::Native, _) | (DeserializerConfig::Avro { .. }, _) => {
                 "application/octet-stream"
             }
+            #[cfg(feature = "arrow")]
+            (DeserializerConfig::ArrowStream, _) => "application/vnd.apache.arrow.stream",
             (DeserializerConfig::Protobuf(_), _) => "application/octet-stream",
             #[cfg(feature = "opentelemetry")]
             (DeserializerConfig::Otlp(_), _) => "application/x-protobuf",
@@ -540,6 +572,9 @@ pub enum Deserializer {
     Influxdb(InfluxdbDeserializer),
     /// Uses a `VrlDeserializer` for deserialization.
     Vrl(VrlDeserializer),
+    #[cfg(feature = "arrow")]
+    /// Uses an `ArrowStreamDeserializer` for deserialization.
+    ArrowStream(ArrowStreamDeserializer),
 }
 
 impl format::Deserializer for Deserializer {
@@ -563,6 +598,8 @@ impl format::Deserializer for Deserializer {
             Deserializer::Gelf(deserializer) => deserializer.parse(bytes, log_namespace),
             Deserializer::Influxdb(deserializer) => deserializer.parse(bytes, log_namespace),
             Deserializer::Vrl(deserializer) => deserializer.parse(bytes, log_namespace),
+            #[cfg(feature = "arrow")]
+            Deserializer::ArrowStream(deserializer) => deserializer.parse(bytes, log_namespace),
         }
     }
 }

@@ -4,7 +4,7 @@
 #![deny(missing_docs)]
 
 #[cfg(feature = "arrow")]
-mod arrow;
+pub(crate) mod arrow;
 mod avro;
 mod cef;
 mod common;
