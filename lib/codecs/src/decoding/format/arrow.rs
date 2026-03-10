@@ -8,6 +8,7 @@ use arrow::datatypes::{
     TimestampSecondType,
 };
 use arrow::ipc::reader::StreamReader;
+use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use chrono::Utc;
 use lookup::event_path;
@@ -63,6 +64,26 @@ impl ArrowStreamDeserializerConfig {
     }
 }
 
+pub struct LogEvents(pub Vec<LogEvent>);
+
+impl TryFrom<&RecordBatch> for LogEvents {
+    type Error = vector_common::Error;
+
+    fn try_from(batch: &RecordBatch) -> vector_common::Result<Self> {
+        let mut logs: Vec<_> = (0..batch.num_rows()).map(|_| LogEvent::default()).collect();
+
+        for (field, col) in batch.schema().fields().iter().zip(batch.columns()) {
+            let name = field.name().as_str();
+            let path = event_path!(name);
+            for (log, value) in logs.iter_mut().zip(column_to_vrl(col)?) {
+                log.insert(path, value);
+            }
+        }
+
+        Ok(LogEvents(logs))
+    }
+}
+
 /// Deserializer that converts Arrow IPC stream bytes to `Event`s.
 #[derive(Debug, Clone)]
 pub struct ArrowStreamDeserializer;
@@ -77,36 +98,28 @@ impl Deserializer for ArrowStreamDeserializer {
             return Ok(smallvec![]);
         }
 
-        let timestamp_key = (log_namespace == LogNamespace::Legacy)
-            .then(|| log_schema().timestamp_key_target_path())
-            .flatten();
+        let timestamp_key = match log_namespace {
+            LogNamespace::Legacy => log_schema().timestamp_key_target_path(),
+            _ => None,
+        };
 
         let reader = StreamReader::try_new(Cursor::new(bytes), None)?;
         let now = Utc::now();
         let mut events = SmallVec::new();
 
         for batch in reader {
-            let batch = batch?;
-            let mut logs: Vec<_> = (0..batch.num_rows()).map(|_| LogEvent::default()).collect();
+            let LogEvents(logs) = LogEvents::try_from(&batch?)?;
+            events.reserve(logs.len());
 
-            for (field, col) in batch.schema().fields().iter().zip(batch.columns()) {
-                let name = field.name().as_str();
-                let path = event_path!(name);
-                for (log, value) in logs.iter_mut().zip(column_to_vrl(col)?) {
-                    log.insert(path, value);
-                }
-            }
-
-            events.extend(logs.into_iter().map(|mut log| {
+            for mut log in logs {
                 if let Some(ts_key) = timestamp_key
                     && !log.contains(ts_key)
                 {
                     log.insert(ts_key, now);
                 }
-                Event::Log(log)
-            }));
+                events.push(Event::Log(log));
+            }
         }
-
         Ok(events)
     }
 }
@@ -236,8 +249,6 @@ fn column_to_vrl(array: &dyn Array) -> vector_common::Result<Vec<VrlValue>> {
                 .collect()
         }
 
-        // NOTE: Duration/Time32/Time64 values are converted to raw integers, losing the
-        // unit information (seconds vs milliseconds vs microseconds vs nanoseconds).
         ArrowDataType::Time32(_) => {
             let casted = arrow::compute::cast(
                 &arrow::compute::cast(array, &ArrowDataType::Int32)?,
@@ -271,7 +282,7 @@ fn column_to_vrl(array: &dyn Array) -> vector_common::Result<Vec<VrlValue>> {
                     if arr.is_null(row) {
                         Ok(VrlValue::Null)
                     } else {
-                        list_to_vrl(arr.value(row).as_ref())
+                        column_to_vrl(arr.value(row).as_ref()).map(VrlValue::Array)
                     }
                 })
                 .collect()
@@ -283,7 +294,7 @@ fn column_to_vrl(array: &dyn Array) -> vector_common::Result<Vec<VrlValue>> {
                     if arr.is_null(row) {
                         Ok(VrlValue::Null)
                     } else {
-                        list_to_vrl(arr.value(row).as_ref())
+                        column_to_vrl(arr.value(row).as_ref()).map(VrlValue::Array)
                     }
                 })
                 .collect()
@@ -295,7 +306,7 @@ fn column_to_vrl(array: &dyn Array) -> vector_common::Result<Vec<VrlValue>> {
                     if arr.is_null(row) {
                         Ok(VrlValue::Null)
                     } else {
-                        list_to_vrl(arr.value(row).as_ref())
+                        column_to_vrl(arr.value(row).as_ref()).map(VrlValue::Array)
                     }
                 })
                 .collect()
@@ -382,11 +393,6 @@ fn column_to_vrl(array: &dyn Array) -> vector_common::Result<Vec<VrlValue>> {
 
         other => Err(format!("unsupported Arrow type: {other}").into()),
     }
-}
-
-/// Convert an Arrow list-like array to a VRL Array.
-fn list_to_vrl(values: &dyn Array) -> vector_common::Result<VrlValue> {
-    column_to_vrl(values).map(VrlValue::Array)
 }
 
 /// Extract an Arrow Timestamp column into VRL Timestamps.
