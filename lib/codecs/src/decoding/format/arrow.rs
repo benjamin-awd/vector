@@ -3,8 +3,8 @@ use std::io::Cursor;
 use arrow::array::cast::AsArray;
 use arrow::array::*;
 use arrow::datatypes::{
-    ArrowTemporalType, DataType as ArrowDataType, Date32Type, Date64Type, Float64Type, Int64Type,
-    TimeUnit, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    ArrowTemporalType, DataType as ArrowDataType, Date64Type, Float64Type, Int64Type, TimeUnit,
+    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
     TimestampSecondType,
 };
 use arrow::ipc::reader::StreamReader;
@@ -64,6 +64,7 @@ impl ArrowStreamDeserializerConfig {
     }
 }
 
+/// A collection of `LogEvent`s converted from an Arrow `RecordBatch`.
 pub struct LogEvents(pub Vec<LogEvent>);
 
 impl TryFrom<&RecordBatch> for LogEvents {
@@ -124,22 +125,35 @@ impl Deserializer for ArrowStreamDeserializer {
     }
 }
 
+/// Convert an array-like type whose rows are sub-arrays into a `Vec<VrlValue::Array>`.
+/// Works for List, LargeList, and FixedSizeList via the `ArrayAccessor` trait.
+fn list_column_to_vrl(
+    len: usize,
+    is_null: impl Fn(usize) -> bool,
+    value: impl Fn(usize) -> ArrayRef,
+) -> vector_common::Result<Vec<VrlValue>> {
+    (0..len)
+        .map(|row| {
+            if is_null(row) {
+                Ok(VrlValue::Null)
+            } else {
+                column_to_vrl(value(row).as_ref()).map(VrlValue::Array)
+            }
+        })
+        .collect()
+}
+
 /// Extract an entire Arrow column into a `Vec<VrlValue>`.
 ///
 /// The array is downcast once per column and iterated contiguously, avoiding
 /// per-row dynamic dispatch and improving cache locality.
 fn column_to_vrl(array: &dyn Array) -> vector_common::Result<Vec<VrlValue>> {
     match array.data_type() {
-        ArrowDataType::Boolean => {
-            let arr = array.as_boolean();
-            Ok(arr
-                .iter()
-                .map(|v| match v {
-                    Some(v) => VrlValue::Boolean(v),
-                    None => VrlValue::Null,
-                })
-                .collect())
-        }
+        ArrowDataType::Boolean => Ok(array
+            .as_boolean()
+            .iter()
+            .map(|v| v.map(VrlValue::Boolean).unwrap_or(VrlValue::Null))
+            .collect()),
 
         // All integer types are cast to Int64 (VRL's only integer representation).
         // Wrapping `as i64` for u64 is consistent with how VRL handles u64
@@ -151,15 +165,15 @@ fn column_to_vrl(array: &dyn Array) -> vector_common::Result<Vec<VrlValue>> {
         | ArrowDataType::UInt8
         | ArrowDataType::UInt16
         | ArrowDataType::UInt32
-        | ArrowDataType::UInt64 => {
+        | ArrowDataType::UInt64
+        | ArrowDataType::Time32(_)
+        | ArrowDataType::Time64(_)
+        | ArrowDataType::Duration(_) => {
             let casted = arrow::compute::cast(array, &ArrowDataType::Int64)?;
             let arr = casted.as_primitive::<Int64Type>();
             Ok(arr
                 .iter()
-                .map(|v| match v {
-                    Some(v) => VrlValue::Integer(v),
-                    None => VrlValue::Null,
-                })
+                .map(|v| v.map(VrlValue::Integer).unwrap_or(VrlValue::Null))
                 .collect())
         }
 
@@ -168,52 +182,23 @@ fn column_to_vrl(array: &dyn Array) -> vector_common::Result<Vec<VrlValue>> {
             let arr = casted.as_primitive::<Float64Type>();
             Ok(arr
                 .iter()
-                .map(|v| match v {
-                    Some(v) => VrlValue::from_f64_or_zero(v),
-                    None => VrlValue::Null,
-                })
+                .map(|v| v.map(VrlValue::from_f64_or_zero).unwrap_or(VrlValue::Null))
                 .collect())
         }
 
-        ArrowDataType::Utf8 => {
-            let arr = array.as_string::<i32>();
-            Ok(arr
-                .iter()
-                .map(|v| v.map(VrlValue::from).unwrap_or(VrlValue::Null))
-                .collect())
-        }
-        ArrowDataType::LargeUtf8 => {
-            let arr = array.as_string::<i64>();
-            Ok(arr
-                .iter()
-                .map(|v| v.map(VrlValue::from).unwrap_or(VrlValue::Null))
-                .collect())
-        }
-        ArrowDataType::Utf8View => {
-            let arr = array.as_string_view();
-            Ok(arr
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View => {
+            let casted = arrow::compute::cast(array, &ArrowDataType::LargeUtf8)?;
+            Ok(casted
+                .as_string::<i64>()
                 .iter()
                 .map(|v| v.map(VrlValue::from).unwrap_or(VrlValue::Null))
                 .collect())
         }
 
-        ArrowDataType::Binary => {
-            let arr = array.as_binary::<i32>();
-            Ok(arr
-                .iter()
-                .map(|v| v.map(VrlValue::from).unwrap_or(VrlValue::Null))
-                .collect())
-        }
-        ArrowDataType::LargeBinary => {
-            let arr = array.as_binary::<i64>();
-            Ok(arr
-                .iter()
-                .map(|v| v.map(VrlValue::from).unwrap_or(VrlValue::Null))
-                .collect())
-        }
-        ArrowDataType::BinaryView => {
-            let arr = array.as_binary_view();
-            Ok(arr
+        ArrowDataType::Binary | ArrowDataType::LargeBinary | ArrowDataType::BinaryView => {
+            let casted = arrow::compute::cast(array, &ArrowDataType::LargeBinary)?;
+            Ok(casted
+                .as_binary::<i64>()
                 .iter()
                 .map(|v| v.map(VrlValue::from).unwrap_or(VrlValue::Null))
                 .collect())
@@ -221,22 +206,9 @@ fn column_to_vrl(array: &dyn Array) -> vector_common::Result<Vec<VrlValue>> {
 
         ArrowDataType::Timestamp(unit, _) => timestamp_column_to_vrl(array, unit),
 
-        ArrowDataType::Date32 => {
-            let arr = array.as_primitive::<Date32Type>();
-            (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        return Ok(VrlValue::Null);
-                    }
-                    arr.value_as_date(i)
-                        .and_then(|d| d.and_hms_opt(0, 0, 0))
-                        .map(|dt| VrlValue::Timestamp(dt.and_utc()))
-                        .ok_or_else(|| "Invalid Date32 value".into())
-                })
-                .collect()
-        }
-        ArrowDataType::Date64 => {
-            let arr = array.as_primitive::<Date64Type>();
+        ArrowDataType::Date32 | ArrowDataType::Date64 => {
+            let casted = arrow::compute::cast(array, &ArrowDataType::Date64)?;
+            let arr = casted.as_primitive::<Date64Type>();
             (0..arr.len())
                 .map(|i| {
                     if arr.is_null(i) {
@@ -244,72 +216,22 @@ fn column_to_vrl(array: &dyn Array) -> vector_common::Result<Vec<VrlValue>> {
                     }
                     arr.value_as_datetime(i)
                         .map(|dt| VrlValue::Timestamp(dt.and_utc()))
-                        .ok_or_else(|| "Invalid Date64 value".into())
+                        .ok_or_else(|| "Invalid date value".into())
                 })
                 .collect()
-        }
-
-        ArrowDataType::Time32(_) => {
-            let casted = arrow::compute::cast(
-                &arrow::compute::cast(array, &ArrowDataType::Int32)?,
-                &ArrowDataType::Int64,
-            )?;
-            let arr = casted.as_primitive::<Int64Type>();
-            Ok(arr
-                .iter()
-                .map(|v| match v {
-                    Some(v) => VrlValue::Integer(v),
-                    None => VrlValue::Null,
-                })
-                .collect())
-        }
-        ArrowDataType::Time64(_) | ArrowDataType::Duration(_) => {
-            let casted = arrow::compute::cast(array, &ArrowDataType::Int64)?;
-            let arr = casted.as_primitive::<Int64Type>();
-            Ok(arr
-                .iter()
-                .map(|v| match v {
-                    Some(v) => VrlValue::Integer(v),
-                    None => VrlValue::Null,
-                })
-                .collect())
         }
 
         ArrowDataType::List(_) => {
             let arr = array.as_list::<i32>();
-            (0..arr.len())
-                .map(|row| {
-                    if arr.is_null(row) {
-                        Ok(VrlValue::Null)
-                    } else {
-                        column_to_vrl(arr.value(row).as_ref()).map(VrlValue::Array)
-                    }
-                })
-                .collect()
+            list_column_to_vrl(arr.len(), |i| arr.is_null(i), |i| arr.value(i))
         }
         ArrowDataType::LargeList(_) => {
             let arr = array.as_list::<i64>();
-            (0..arr.len())
-                .map(|row| {
-                    if arr.is_null(row) {
-                        Ok(VrlValue::Null)
-                    } else {
-                        column_to_vrl(arr.value(row).as_ref()).map(VrlValue::Array)
-                    }
-                })
-                .collect()
+            list_column_to_vrl(arr.len(), |i| arr.is_null(i), |i| arr.value(i))
         }
         ArrowDataType::FixedSizeList(..) => {
             let arr = array.as_fixed_size_list();
-            (0..arr.len())
-                .map(|row| {
-                    if arr.is_null(row) {
-                        Ok(VrlValue::Null)
-                    } else {
-                        column_to_vrl(arr.value(row).as_ref()).map(VrlValue::Array)
-                    }
-                })
-                .collect()
+            list_column_to_vrl(arr.len(), |i| arr.is_null(i), |i| arr.value(i))
         }
 
         ArrowDataType::Struct(fields) => {

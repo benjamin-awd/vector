@@ -21,7 +21,7 @@ mod vrl;
 
 use ::bytes::Bytes;
 #[cfg(feature = "arrow")]
-pub use arrow::{ArrowStreamDeserializer, ArrowStreamDeserializerConfig};
+pub use arrow::{ArrowStreamDeserializer, ArrowStreamDeserializerConfig, LogEvents};
 pub use avro::{AvroDeserializer, AvroDeserializerConfig, AvroDeserializerOptions};
 use dyn_clone::DynClone;
 pub use gelf::{GelfDeserializer, GelfDeserializerConfig, GelfDeserializerOptions};
