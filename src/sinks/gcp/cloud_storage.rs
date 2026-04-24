@@ -462,9 +462,7 @@ impl RequestBuilder<(String, Vec<Event>)> for RequestSettings {
         let filename = {
             let seconds = match self.tz_offset {
                 Some(offset) => Utc::now().with_timezone(&offset).format(&self.time_format),
-                None => Utc::now()
-                    .with_timezone(&chrono::Utc)
-                    .format(&self.time_format),
+                None => Utc::now().format(&self.time_format),
             };
 
             if self.append_uuid {
