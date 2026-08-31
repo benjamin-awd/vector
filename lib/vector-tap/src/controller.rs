@@ -14,7 +14,7 @@ use uuid::Uuid;
 use vector_buffers::{WhenFull, topology::builder::TopologyBuilder};
 use vector_common::config::ComponentKey;
 use vector_core::{
-    event::{EventArray, LogArray, MetricArray, TraceArray},
+    event::{EventArray, LogBatch, MetricArray, TraceArray},
     fanout,
 };
 
@@ -104,7 +104,7 @@ impl TapPatterns {
 /// status of the tap request.
 #[derive(Debug)]
 pub enum TapPayload {
-    Log(TapOutput, LogArray),
+    Log(TapOutput, LogBatch),
     Metric(TapOutput, MetricArray),
     Trace(TapOutput, TraceArray),
     Notification(Notification),

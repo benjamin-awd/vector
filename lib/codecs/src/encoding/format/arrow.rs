@@ -234,6 +234,20 @@ pub fn encode_events_to_arrow_ipc_stream(
     Ok(buffer.into_inner().freeze())
 }
 
+/// Encodes an already-built [`RecordBatch`] into Arrow IPC streaming format.
+///
+/// This is the columnar fast path: unlike [`encode_events_to_arrow_ipc_stream`], it does no
+/// `Event`/`serde_json` transpose — the batch is written straight to the IPC stream.
+pub fn encode_record_batch(record_batch: &RecordBatch) -> Result<Bytes, ArrowEncodingError> {
+    let mut buffer = BytesMut::new().writer();
+    let mut writer =
+        StreamWriter::try_new(&mut buffer, record_batch.schema_ref()).context(IpcWriteSnafu)?;
+    writer.write(record_batch).context(IpcWriteSnafu)?;
+    writer.finish().context(IpcWriteSnafu)?;
+
+    Ok(buffer.into_inner().freeze())
+}
+
 /// Recursively makes a Field and all its nested fields nullable
 fn make_field_nullable(field: &Field) -> Result<Field, ArrowEncodingError> {
     let new_data_type = match field.data_type() {
@@ -407,6 +421,37 @@ mod tests {
             log.insert(&vrl::path::parse_target_path(key).unwrap(), value.into());
         }
         Event::Log(log)
+    }
+
+    #[test]
+    fn encode_record_batch_round_trips() {
+        use std::sync::Arc;
+
+        use arrow::{
+            array::{Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("seq", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["AAA", "BBB", "CCC"])),
+                Arc::new(Int64Array::from(vec![0_i64, 1, 2])),
+            ],
+        )
+        .unwrap();
+
+        // The columnar fast path encodes the batch straight to IPC with no Event/serde_json transpose.
+        let bytes = encode_record_batch(&batch).expect("encode");
+        let mut reader = StreamReader::try_new(Cursor::new(bytes), None).expect("reader");
+        let decoded = reader.next().expect("one batch").expect("ok");
+
+        assert_eq!(decoded, batch);
+        assert!(reader.next().is_none());
     }
 
     mod comprehensive {

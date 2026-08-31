@@ -498,7 +498,7 @@ async fn nats_jetstream_message_id_valid() {
         "message": "third message",
     }));
 
-    let event_array = EventArray::Logs(vec![event1, event2, event3]);
+    let event_array = EventArray::Logs(vec![event1, event2, event3].into());
     sink.run(futures::stream::iter(vec![event_array]).boxed())
         .await
         .unwrap();

@@ -352,7 +352,7 @@ impl ValidatedSink for ClickhouseConfig {
         );
 
         let healthcheck = Box::pin(healthcheck(client, endpoint, auth.clone()));
-        Ok((VectorSink::from_event_streamsink(sink), healthcheck))
+        Ok((VectorSink::from_event_array_sink(sink), healthcheck))
     }
 }
 

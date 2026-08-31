@@ -258,7 +258,7 @@ impl OutputBuffer {
         // Coalesce multiple pushes of the same type into one array.
         match (event, self.0.last_mut()) {
             (Event::Log(log), Some(EventArray::Logs(logs))) => {
-                logs.push(log);
+                logs.as_rows_mut().push(log);
             }
             (Event::Metric(metric), Some(EventArray::Metrics(metrics))) => {
                 metrics.push(metric);

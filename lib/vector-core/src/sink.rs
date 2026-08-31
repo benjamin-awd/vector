@@ -78,6 +78,15 @@ impl VectorSink {
         let sink = Box::new(sink);
         VectorSink::Stream(Box::new(EventStream { sink }))
     }
+
+    /// Converts a sink that consumes `EventArray`s directly into a `VectorSink`.
+    ///
+    /// Unlike [`VectorSink::from_event_streamsink`], this does **not** flatten each `EventArray`
+    /// into per-`Event` items at the sink boundary, so a sink can observe and consume a batch's
+    /// native representation (e.g. a columnar `LogBatch`) un-materialized.
+    pub fn from_event_array_sink(sink: impl StreamSink<EventArray> + Send + 'static) -> Self {
+        VectorSink::Stream(Box::new(sink))
+    }
 }
 
 impl fmt::Debug for VectorSink {

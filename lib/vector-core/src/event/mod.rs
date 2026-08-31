@@ -1,6 +1,10 @@
 use std::{convert::TryInto, fmt::Debug, sync::Arc};
 
-pub use array::{EventArray, EventContainer, LogArray, MetricArray, TraceArray, into_event_stream};
+#[cfg(feature = "columnar")]
+pub use array::BatchMetadata;
+pub use array::{
+    EventArray, EventContainer, LogBatch, LogRepr, MetricArray, TraceArray, into_event_stream,
+};
 pub use estimated_json_encoded_size_of::EstimatedJsonEncodedSizeOf;
 pub use finalization::{
     BatchNotifier, BatchStatus, BatchStatusReceiver, EventFinalizer, EventFinalizerGroups,
@@ -26,6 +30,8 @@ use crate::config::{LogNamespace, OutputId};
 #[cfg(any(test, feature = "generate-fixtures"))]
 pub(crate) mod arbitrary_impl;
 pub mod array;
+#[cfg(feature = "columnar")]
+mod columnar;
 pub mod discriminant;
 mod estimated_json_encoded_size_of;
 mod log_event;

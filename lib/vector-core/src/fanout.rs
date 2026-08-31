@@ -675,6 +675,60 @@ mod tests {
         }
     }
 
+    // Phase 2: a columnar log batch must survive the graph un-materialized. This exercises the
+    // two "free" paths at once — the fanout clone/move to N downstreams, and the in-memory buffer
+    // channel (`standalone_memory`) each receiver sits behind — asserting the batch is still
+    // `LogRepr::Columns` on the far side and data-equal to what was sent.
+    #[cfg(feature = "columnar")]
+    #[tokio::test]
+    async fn fanout_preserves_columnar_batch() {
+        use std::sync::Arc;
+
+        use arrow::{
+            array::{Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+
+        use crate::event::{BatchMetadata, EventMetadata, LogBatch, LogRepr};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("seq", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["AAA", "BBB"])),
+                Arc::new(Int64Array::from(vec![0_i64, 1])),
+            ],
+        )
+        .unwrap();
+        let events = EventArray::Logs(LogBatch::columns(
+            batch,
+            BatchMetadata::Shared(EventMetadata::default()),
+        ));
+
+        let (mut fanout, _, receivers) = fanout_from_senders(&[2, 2]);
+        fanout
+            .send(events.clone(), None)
+            .await
+            .expect("should not fail");
+
+        for receiver in receivers {
+            let got = collect_ready(receiver.into_stream());
+            assert_eq!(got.len(), 1);
+            match &got[0] {
+                EventArray::Logs(batch) => assert!(
+                    matches!(batch.repr(), LogRepr::Columns { .. }),
+                    "batch must remain columnar through fanout + memory buffer"
+                ),
+                other => panic!("expected a columnar log batch, got {other:?}"),
+            }
+            assert_eq!(got[0], events);
+        }
+    }
+
     #[tokio::test]
     async fn fanout_notready() {
         let (mut fanout, _, mut receivers) = fanout_from_senders(&[2, 1, 2]);

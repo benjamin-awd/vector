@@ -66,6 +66,11 @@ use crate::{
     shutdown::ShutdownSignal,
 };
 
+#[cfg(feature = "columnar")]
+use crate::event::{
+    BatchMetadata, EventArray, EventContainer, EventFinalizer, EventMetadata, LogBatch,
+};
+
 #[derive(Debug, Snafu)]
 enum BuildError {
     #[snafu(display("The drain_timeout_ms ({}) must be less than session_timeout_ms ({})", value, session_timeout_ms.as_millis()))]
@@ -85,6 +90,24 @@ enum BuildError {
 struct Metrics {
     /// Expose topic lag metrics for all topics and partitions. Metric names are `kafka_consumer_lag`.
     pub topic_lag_metric: bool,
+}
+
+/// How each Kafka message payload is decoded.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KafkaBatchEncoding {
+    /// Decode each record individually using the configured `framing`/`decoding`,
+    /// producing one row-shaped `LogEvent` per record. This is the default.
+    #[default]
+    Standard,
+    /// Treat each message payload as an Arrow IPC stream and carry it through the
+    /// pipeline as a columnar batch, without materializing per-event rows.
+    ///
+    /// This is the firehose fast path for producers that already emit Arrow. It
+    /// requires the `columnar` build feature; configuring it in a build without
+    /// that feature is a configuration error.
+    ArrowStream,
 }
 
 /// Configuration for the `kafka` source.
@@ -233,6 +256,15 @@ pub struct KafkaSourceConfig {
     #[derivative(Default(value = "default_decoding()"))]
     decoding: DeserializerConfig,
 
+    /// How to interpret each Kafka message payload.
+    ///
+    /// With `arrow_stream`, each payload is decoded as an Arrow IPC stream and carried through the
+    /// pipeline as a columnar batch (requires the `columnar` build feature). The `framing` and
+    /// `decoding` options are ignored on that path.
+    #[configurable(derived)]
+    #[serde(default)]
+    batch_encoding: KafkaBatchEncoding,
+
     #[configurable(derived)]
     #[serde(default, deserialize_with = "bool_or_struct")]
     acknowledgements: SourceAcknowledgementsConfig,
@@ -320,6 +352,13 @@ impl_generate_config_from_default!(KafkaSourceConfig);
 impl SourceConfig for KafkaSourceConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
+
+        #[cfg(not(feature = "columnar"))]
+        if self.batch_encoding == KafkaBatchEncoding::ArrowStream {
+            return Err(
+                "`batch_encoding = arrow_stream` requires the `columnar` build feature".into(),
+            );
+        }
 
         let decoder =
             DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
@@ -584,6 +623,7 @@ impl ConsumerStateInner<Consuming> {
     ) -> (oneshot::Sender<()>, tokio::task::AbortHandle) {
         let keys = self.config.keys();
         let decoder = self.decoder.clone();
+        let batch_encoding = self.config.batch_encoding;
         let log_namespace = self.log_namespace;
         let mut out = self.out.clone();
 
@@ -645,7 +685,7 @@ impl ConsumerStateInner<Consuming> {
                                 topic: msg.topic(),
                                 partition: msg.partition(),
                             });
-                            parse_message(msg, decoder.clone(), &keys, &mut out, acknowledgements, &finalizer, log_namespace).await;
+                            parse_message(msg, decoder.clone(), batch_encoding, &keys, &mut out, acknowledgements, &finalizer, log_namespace).await;
                         }
                     },
                 )
@@ -945,12 +985,21 @@ fn drive_kafka_consumer(
 async fn parse_message(
     msg: BorrowedMessage<'_>,
     decoder: Decoder,
+    batch_encoding: KafkaBatchEncoding,
     keys: &'_ Keys,
     out: &mut SourceSender,
     acknowledgements: bool,
     finalizer: &Option<OrderedFinalizer<FinalizerEntry>>,
     log_namespace: LogNamespace,
 ) {
+    #[cfg(feature = "columnar")]
+    if batch_encoding == KafkaBatchEncoding::ArrowStream {
+        parse_message_arrow(msg, out, acknowledgements, finalizer).await;
+        return;
+    }
+    // Keep the signature stable across feature configurations; the row path ignores the encoding.
+    let _ = batch_encoding;
+
     if let Some((count, stream)) = parse_stream(&msg, decoder, keys, log_namespace) {
         let (batch, receiver) = BatchNotifier::new_with_receiver();
         let mut stream = stream.map(|event| {
@@ -976,6 +1025,82 @@ async fn parse_message(
                 }
             }
         }
+    }
+}
+
+/// Columnar fast path: decode an Arrow-IPC message payload straight into one or more
+/// `RecordBatch`es and emit each as a `LogRepr::Columns` batch, without ever materializing
+/// per-event rows.
+///
+/// The batch is a pure passthrough of the producer's Arrow: no Kafka envelope metadata
+/// (`topic`/`partition`/`offset`/…) is appended. That parity with the row path is intentionally
+/// dropped here because `FORMAT ArrowStream` inserts are schema-strict — appending columns the
+/// target table does not define would turn every insert into a schema-mismatch error. If Kafka
+/// provenance is needed, the producer should include it in the Arrow schema.
+#[cfg(feature = "columnar")]
+async fn parse_message_arrow(
+    msg: BorrowedMessage<'_>,
+    out: &mut SourceSender,
+    acknowledgements: bool,
+    finalizer: &Option<OrderedFinalizer<FinalizerEntry>>,
+) {
+    let Some(payload) = msg.payload() else {
+        return; // skip empty payloads, mirroring the row path
+    };
+
+    let reader = match arrow::ipc::reader::StreamReader::try_new(Cursor::new(payload), None) {
+        Ok(reader) => reader,
+        Err(error) => {
+            error!(
+                message = "Failed to decode Kafka message payload as an Arrow IPC stream.",
+                %error,
+            );
+            return;
+        }
+    };
+
+    // One `BatchNotifier` per message ties the offset commit to delivery of every batch it decodes
+    // into, exactly as the row path does (the notifier fires when all its clones are acked/dropped).
+    let (batch_notifier, receiver) = BatchNotifier::new_with_receiver();
+    let mut sent_rows = 0usize;
+
+    for result in reader {
+        let record_batch = match result {
+            Ok(record_batch) => record_batch,
+            Err(error) => {
+                error!(
+                    message = "Failed to read an Arrow record batch from a Kafka message.",
+                    %error,
+                );
+                break;
+            }
+        };
+
+        let mut metadata = EventMetadata::default();
+        if acknowledgements {
+            metadata.add_finalizer(EventFinalizer::new(batch_notifier.clone()));
+        }
+        let events = EventArray::Logs(LogBatch::columns(
+            record_batch,
+            BatchMetadata::Shared(metadata),
+        ));
+
+        emit!(KafkaEventsReceived {
+            count: events.len(),
+            byte_size: events.estimated_json_encoded_size_of(),
+            topic: msg.topic(),
+            partition: msg.partition(),
+        });
+        sent_rows += events.len();
+
+        if out.send_event(events).await.is_err() {
+            emit!(StreamClosedError { count: sent_rows });
+            return;
+        }
+    }
+
+    if let Some(f) = finalizer.as_ref() {
+        f.add(msg.into(), receiver);
     }
 }
 

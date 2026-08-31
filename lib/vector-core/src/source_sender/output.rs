@@ -208,17 +208,25 @@ impl Output {
         let send_reference = Instant::now();
 
         // Emit lag time after the post-processor so that any timestamp mutations made by the
-        // processor are reflected in the metric.
-        events
-            .iter_events()
-            .for_each(|event| self.emit_lag_time(event, reference));
+        // processor are reflected in the metric. Lag time is a per-event timestamp read, which
+        // is not expressible over a columnar batch, so this pass falls back to materializing
+        // (only when a lag-time metric is actually registered — otherwise it is skipped and the
+        // columnar fast path is preserved).
+        if self.metrics.lag_time.is_some() {
+            events.materialize();
+            events
+                .iter_events()
+                .for_each(|event| self.emit_lag_time(event, reference));
+        }
 
-        events.iter_events_mut().for_each(|mut event| {
-            // attach runtime schema definitions from the source
+        // Attach runtime schema definitions and the upstream id. This is applied at the *batch*
+        // level so that a columnar `LogBatch` stamps its `BatchMetadata` without materializing to
+        // per-event rows (see `LogBatch::for_each_metadata_mut`).
+        events.for_each_metadata_mut(|metadata| {
             if let Some(log_definition) = &self.log_definition {
-                event.metadata_mut().set_schema_definition(log_definition);
+                metadata.set_schema_definition(log_definition);
             }
-            event.metadata_mut().set_upstream_id(Arc::clone(&self.id));
+            metadata.set_upstream_id(Arc::clone(&self.id));
         });
 
         let byte_size = events.estimated_json_encoded_size_of();

@@ -23,7 +23,7 @@ use super::{EventMetadata, array, metric::MetricSketch};
 impl event_array::Events {
     // We can't use the standard `From` traits here because the actual
     // type of `LogArray` and `TraceArray` are the same.
-    fn from_logs(logs: array::LogArray) -> Self {
+    fn from_logs(logs: Vec<crate::event::LogEvent>) -> Self {
         let logs = logs.into_iter().map(Into::into).collect();
         Self::Logs(LogArray { logs })
     }
@@ -42,7 +42,7 @@ impl event_array::Events {
 impl From<array::EventArray> for EventArray {
     fn from(events: array::EventArray) -> Self {
         let events = Some(match events {
-            array::EventArray::Logs(array) => event_array::Events::from_logs(array),
+            array::EventArray::Logs(array) => event_array::Events::from_logs(array.into()),
             array::EventArray::Metrics(array) => event_array::Events::from_metrics(array),
             array::EventArray::Traces(array) => event_array::Events::from_traces(array),
         });

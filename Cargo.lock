@@ -13555,6 +13555,7 @@ name = "vector-core"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "arrow 59.1.0",
  "async-trait",
  "base64 0.23.0",
  "bitmask-enum",

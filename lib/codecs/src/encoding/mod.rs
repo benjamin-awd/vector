@@ -16,7 +16,7 @@ pub use encoder::{Encoder, EncoderKind};
 #[cfg(feature = "arrow")]
 pub use format::{
     ArrowEncodingError, ArrowStreamSerializer, ArrowStreamSerializerConfig, SchemaProvider,
-    find_null_non_nullable_fields,
+    encode_record_batch, find_null_non_nullable_fields,
 };
 pub use format::{
     AvroSerializer, AvroSerializerConfig, AvroSerializerOptions, CefSerializer,

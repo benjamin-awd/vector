@@ -668,6 +668,10 @@ enrichment-tables-geoip = ["dep:maxminddb"]
 enrichment-tables-mmdb = ["dep:maxminddb"]
 enrichment-tables-memory = ["dep:bloomy", "dep:cuckoo-clock", "dep:evmap", "dep:evmap-derive", "dep:thread_local", "dep:tempfile"]
 
+# Columnar (Arrow `RecordBatch`) backing for log batches; enables the Kafka
+# source `batch_encoding = arrow_stream` fast path. See `event::LogBatch`.
+columnar = ["vector-lib/columnar", "codecs-arrow"]
+
 # Codecs
 codecs-arrow = ["dep:arrow", "dep:arrow-schema", "vector-lib/arrow"]
 codecs-parquet = ["dep:parquet", "codecs-arrow", "vector-lib/parquet"]

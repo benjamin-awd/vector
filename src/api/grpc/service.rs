@@ -781,7 +781,7 @@ fn tap_payload_to_output_events(payload: TapPayload) -> Vec<StreamOutputEventsRe
     use crate::event::proto::{Event, EventWrapper};
 
     match payload {
-        TapPayload::Log(output, log_array) => log_array
+        TapPayload::Log(output, log_array) => Vec::<crate::event::LogEvent>::from(log_array)
             .into_iter()
             .map(|log_event| {
                 // Convert Vector's internal LogEvent to proto Log (metadata is preserved in Log.metadata_full)
